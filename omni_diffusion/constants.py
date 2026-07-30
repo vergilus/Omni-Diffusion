@@ -2,6 +2,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+FunAudioLLM_path = "/share/users/zouwei/models/FunAudioLLM/SenseVoiceSmall/"
 
 if False:
     IMG_TAG_TOKEN = "<image>"

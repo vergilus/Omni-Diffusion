@@ -21,7 +21,8 @@ setuptools
 pyworld==v0.3.4
 evaluate
 hyperpyyaml
-diffusers
+diffusers==0.32.2
+torchcodec
 conformer
 hydra-core
 lightning

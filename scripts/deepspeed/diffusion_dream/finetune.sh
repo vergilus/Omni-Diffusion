@@ -50,10 +50,10 @@ echo ${@}
 ######################################################################
 DATA_PATH=${CODE_PATH}/configs/finetune.yaml
 
-MODEL_NAME_OR_PATH="../models/Omni-Diffusion"
-AUDIO_TOKENIZER_PATH="../models/THUDM/glm-4-voice-tokenizer"
-AUDIO_MODEL_NAME_OR_PATH="../models/FunAudioLLM/SenseVoiceSmall/model.pt"
-IMAGE_TOKENIZER_PATH="../models/magvitv2"
+MODEL_NAME_OR_PATH="/share/users/zouwei/models/Omni-Diffusion"
+AUDIO_TOKENIZER_PATH="/share/users/zouwei/models/THUDM/glm-4-voice-tokenizer"
+AUDIO_MODEL_NAME_OR_PATH="/share/users/zouwei/models/FunAudioLLM/SenseVoiceSmall/model.pt"
+IMAGE_TOKENIZER_PATH="/share/users/zouwei/models/magvitv2"
 
 rsync -avh ${DATA_PATH} ${OUTPUT_DIR}
 

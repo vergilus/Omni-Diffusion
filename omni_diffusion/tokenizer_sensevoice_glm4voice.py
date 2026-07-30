@@ -19,6 +19,7 @@ from flow_inference import AudioDecoder
 from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
 from funasr.models.sense_voice.model import SenseVoiceSmall
 import sys
+from omni_diffusion.constants import FunAudioLLM_path
             
 from .constants import (
     AUD_CONTEXT_TOKEN,
@@ -116,9 +117,14 @@ class SenseVoiceGLM4VoiceTokenizer:
 
         logger.info(f"{self.device=} Loading SenseVoiceSmall")
         from huggingface_hub import snapshot_download
-        model_dir = snapshot_download(repo_id="FunAudioLLM/SenseVoiceSmall")
+        # model_dir = snapshot_download(repo_id="FunAudioLLM/SenseVoiceSmall")
+        model_dir = FunAudioLLM_path
         
-        _, self.kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=self.device)
+        from funasr import AutoModel as FunASRAutoModel
+
+        _, self.kwargs = FunASRAutoModel.build_model(
+            model=model_dir, device=self.device, trust_remote_code=False
+        )
         logger.info(f"{self.device=} Loading SenseVoiceSmall Done")
 
         logger.info(f"{self.device=} Loading GLM4VoiceTokenizer")

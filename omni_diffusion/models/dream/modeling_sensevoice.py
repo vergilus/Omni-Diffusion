@@ -14,6 +14,7 @@ from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
 from funasr.metrics.compute_acc import compute_accuracy, th_accuracy
 from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
 # from utils.ctc_alignment import ctc_forced_align
+from omni_diffusion.constants import FunAudioLLM_path
 
 def ctc_forced_align(
     log_probs: torch.Tensor,
@@ -728,7 +729,7 @@ class SenseVoiceSmall(nn.Module):
     @staticmethod
     def from_pretrained(model:str=None, **kwargs):
         from funasr import AutoModel
-        model, kwargs = AutoModel.build_model(model=model, trust_remote_code=True, **kwargs)
+        model, kwargs = AutoModel.build_model(model=model, trust_remote_code=False, **kwargs)
         
         return model, kwargs
 
@@ -1078,8 +1079,9 @@ class AudioEncoder(nn.Module):
 
         # model_dir = "SenceVoiceSmall"
         from huggingface_hub import snapshot_download
-        model_dir = snapshot_download(repo_id="FunAudioLLM/SenseVoiceSmall")
-        self.model, self.kwargs = self.build_model(model=model_dir, trust_remote_code=True,)
+        # model_dir = snapshot_download(repo_id="FunAudioLLM/SenseVoiceSmall")
+        model_dir = FunAudioLLM_path
+        self.model, self.kwargs = self.build_model(model=model_dir, trust_remote_code=False)
 
     
     def forward(
@@ -1255,4 +1257,3 @@ class AudioEncoder(nn.Module):
             tables.print()
 
         return model, kwargs
-

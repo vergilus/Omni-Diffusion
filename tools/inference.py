@@ -78,10 +78,7 @@ class S2SInference:
         self, model_name_or_path, audio_tokenizer_path, audio_tokenizer_type, image_tokenizer_path, flow_path=None,
     ):
 
-        config = AutoConfig.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=True,
-        )
+        config = DreamConfig.from_pretrained(model_name_or_path)
 
         chat_template = qwen2_chat_template
         add_generation_prompt = True
@@ -95,12 +92,12 @@ class S2SInference:
         # print(f"{tokenizer=}")
         print(f"{tokenizer.get_chat_template()=}")
 
-        model = AutoModel.from_pretrained(
+        model = DreamModel.from_pretrained(
             model_name_or_path,
-            trust_remote_code=True,
+            config=config,
             device_map=device_map,
             torch_dtype=torch_dtype,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         ).eval()
         # print("model", model)
         print(f"{model.config.model_type=}")
