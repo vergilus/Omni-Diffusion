@@ -264,8 +264,11 @@ class S2SInference:
             audio_indices = None
 
         input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda")
-        
         print("input", self.tokenizer.decode(input_ids[0], skip_special_tokens=False), flush=True)
+        if task == "ASR":  # dynamically override the ASR diffusion decoding
+            max_tokens = int(input_ids.shape[-1] * 0.20)
+            steps = max_tokens // 2
+            print(f"ASR len={max_tokens}, steps={steps}", flush=True)
         outputs, histories = self.model.generate(
             input_ids,
             audios=audios,
@@ -327,8 +330,7 @@ class S2SInference:
 
 def tts_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     TTS_texts = [
-        "Get the trust fund to the bank early.",
-        "It's a nice walk though, with trees and a river and stuff.",
+        "pardon me, thou bleeding piece of earth that I am meek and gentle with these butchers! thou art the ruins of the noblest man that ever livèd in the tide of times. woe to the hand that shed this costly blood! over thy wounds now do I prophesy, which like dumb mouths do ope their ruby lips - To beg the voice and utterance of my tongue."
     ]
     outputs = []
     audios = []
@@ -370,6 +372,7 @@ def asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
             alg=alg,
             repeat_penalty=repeat_penalty,
         )
+        output = output[:output.index("<|im_end|>")] 
         print(f"{output=}", flush=True)
         outputs.append(output)
 
@@ -405,7 +408,8 @@ def t2i_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     images = []
     
     prompts = [
-        "The image shows a landscape background with double exposure glasses of wine, displaying a hyperealistic and detailed view of the subject.",
+        "A black-and-white charcoal pencil sketch of a human skeleton, low angle shot, soft shading, clearly visible clavicle and neck bones. Faded edges blending seamlessly into the off-white background, misty and hazy effect, rough sketch paper texture, gritty realism, artistic monochrome illustration, cinematic moody lighting",
+        "The image shows a landscape background with double exposure glasses of wine, displaying a hyperealistic and detailed view of the subject."
     ]
     for prompt in prompts:
         output, _, image = s2s_inference.run_infer(
@@ -446,7 +450,6 @@ def s2i_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
         images.append(image)
 
     return outputs, images
-
 
 def svqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     outputs = []
@@ -537,7 +540,7 @@ if __name__ == "__main__":
     save_output(output_path, "s2i", output, images, None)
 
     # text-to-image
-    output, images = t2i_task(s2s_inference, 260, 260, "entropy-penalty", 1.2)
+    output, images = t2i_task(s2s_inference, 350, 260, "entropy-penalty", 1.2)
     save_output(output_path, "t2i", output, images, None)
 
     # spoken visual qa
@@ -549,9 +552,9 @@ if __name__ == "__main__":
     save_output(output_path, "vqa", output, None, None)
 
     # tts
-    output, speech = tts_task(s2s_inference, 50, 25, "entropy", 1.0)
+    output, speech = tts_task(s2s_inference, 300, 50, "entropy", 1.0)
     save_output(output_path, "tts", output, None, speech)
 
     # asr
-    output = asr_task(s2s_inference, 50, 25, "entropy", 1.0)
+    output = asr_task(s2s_inference, -1, -1, "entropy", 1.0)  # steps and max_tokens are overridden in the run_infer  
     save_output(output_path, "asr", output, None, None)
