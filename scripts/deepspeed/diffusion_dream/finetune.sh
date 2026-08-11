@@ -16,46 +16,46 @@ then
 fi
 
 ######################################################################
-export ROOT_PATH=/data/
-export CODE_PATH=${ROOT_PATH}/Omni-Diffusion/
+export ROOT_PATH="/share/users/zouwei"
+export CODE_PATH="${ROOT_PATH}/projects/Omni-Diffusion"
 
 cd ${CODE_PATH}
 
 ######################################################################
-source ${CODE_PATH}/scripts/set_env_ds_gpu.sh
+source "${CODE_PATH}/scripts/set_env_ds_gpu.sh"
 python -m pip install diffusers==0.32.2
 python -m pip install jaxtyping
 python -m pip install peft==0.17.1
 
 ######################################################################
-OUTPUT_DIR=${ROOT_PATH}/output/LM/"$0"/${timestamp}/
+OUTPUT_DIR="${ROOT_PATH}/output/LM/${0}/${timestamp}/"
 
-mkdir -p ${OUTPUT_DIR}
-rsync -avh $0 ${OUTPUT_DIR}
+mkdir -p "${OUTPUT_DIR}"
+rsync -avh $0 "${OUTPUT_DIR}"
 
 export HF_HOME="${ROOT_PATH}/data/HF_HOME_node${INDEX}/"
-mkdir -p ${HF_HOME}
+mkdir -p "${HF_HOME}"
 
-export TRITON_CACHE_DIR=${CODE_PATH}
+export TRITON_CACHE_DIR="${CODE_PATH}"
 
-export PYTHONPATH=$PYTHONPATH:${CODE_PATH}/third_party/GLM-4-Voice:${CODE_PATH}/third_party/GLM-4-Voice/third_party/Matcha-TTS/
+export PYTHONPATH="${PYTHONPATH}:${CODE_PATH}/third_party/GLM-4-Voice:${CODE_PATH}/third_party/GLM-4-Voice/third_party/Matcha-TTS/"
 
 ######################################################################
-LOG=${OUTPUT_DIR}/log_node${INDEX}.txt
+LOG="${OUTPUT_DIR}/log_node${INDEX}.txt"
 exec &> >(tee -a "$LOG")
 echo Logging output to "$LOG"
 
 echo ${@}
 
 ######################################################################
-DATA_PATH=${CODE_PATH}/configs/finetune.yaml
+DATA_PATH="${ROOT_PATH}/data/finetune.yaml"
 
-MODEL_NAME_OR_PATH="/share/users/zouwei/models/Omni-Diffusion"
-AUDIO_TOKENIZER_PATH="/share/users/zouwei/models/THUDM/glm-4-voice-tokenizer"
-AUDIO_MODEL_NAME_OR_PATH="/share/users/zouwei/models/FunAudioLLM/SenseVoiceSmall/model.pt"
-IMAGE_TOKENIZER_PATH="/share/users/zouwei/models/magvitv2"
+MODEL_NAME_OR_PATH="${ROOT_PATH}/models/Omni-Diffusion"
+AUDIO_TOKENIZER_PATH="${ROOT_PATH}/models/THUDM/glm-4-voice-tokenizer"
+AUDIO_MODEL_NAME_OR_PATH="${ROOT_PATH}/models/FunAudioLLM/SenseVoiceSmall/model.pt"
+IMAGE_TOKENIZER_PATH="${ROOT_PATH}/models/magvitv2"
 
-rsync -avh ${DATA_PATH} ${OUTPUT_DIR}
+rsync -avh "${DATA_PATH}" "${OUTPUT_DIR}"
 
 ######################################################################
 export NCCL_NVLS_ENABLE=0
@@ -72,18 +72,18 @@ DISTRIBUTED_ARGS="
 python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.py \
     --log_level "info" \
     --do_train \
-    --config_name ${CODE_PATH}/omni_diffusion/models/dream/config_dream_resume.json \
-    --tokenizer_name $MODEL_NAME_OR_PATH \
-    --model_name_or_path $MODEL_NAME_OR_PATH \
-    --audio_model_name_or_path ${AUDIO_MODEL_NAME_OR_PATH} \
-    --audio_tokenizer_path $AUDIO_TOKENIZER_PATH \
+    --config_name "${CODE_PATH}/omni_diffusion/models/dream/config_dream_resume.json" \
+    --tokenizer_name "${MODEL_NAME_OR_PATH}" \
+    --model_name_or_path "${MODEL_NAME_OR_PATH}" \
+    --audio_model_name_or_path "${AUDIO_MODEL_NAME_OR_PATH}" \
+    --audio_tokenizer_path "${AUDIO_TOKENIZER_PATH}" \
     --audio_tokenizer_type "sensevoice_glm4voice" \
-    --image_tokenizer_path $IMAGE_TOKENIZER_PATH \
-    --dataset_name $DATA_PATH \
+    --image_tokenizer_path "${IMAGE_TOKENIZER_PATH}" \
+    --dataset_name "${DATA_PATH}" \
     --bf16 True \
     --tf32 True \
     --torch_dtype bfloat16 \
-    --output_dir $OUTPUT_DIR \
+    --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
     --max_steps 24000 \
     --per_device_train_batch_size 1 \
@@ -102,12 +102,12 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.p
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --report_to "tensorboard" \
-    --model_max_length ${SEQ_LENGTH} \
+    --model_max_length "${SEQ_LENGTH}" \
     --gradient_checkpointing False \
-    --deepspeed ${CODE_PATH}/scripts/deepspeed/ds_config_zero2.json \
+    --deepspeed "${CODE_PATH}/scripts/deepspeed/ds_config_zero2.json" \
     --trust_remote_code True \
     --ddp_timeout 7200 \
-    --ddp_backend ${DISTRIBUTED_BACKEND} \
+    --ddp_backend "${DISTRIBUTED_BACKEND}" \
     --attn_implementation flash_attention_2 \
     --seed 956 \
     --data_seed 956 \

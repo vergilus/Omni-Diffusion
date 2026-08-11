@@ -1,5 +1,5 @@
 expecttest
-peft
+peft==0.17.1
 xlsxwriter
 termcolor
 tabulate
@@ -31,6 +31,7 @@ wget
 funasr
 zhconv
 jiwer
+jaxtyping
 zhon
 WeTextProcessing
 inflect
