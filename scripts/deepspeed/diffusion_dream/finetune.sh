@@ -23,12 +23,9 @@ cd ${CODE_PATH}
 
 ######################################################################
 source "${CODE_PATH}/scripts/set_env_ds_gpu.sh"
-python -m pip install diffusers==0.32.2
-python -m pip install jaxtyping
-python -m pip install peft==0.17.1
 
 ######################################################################
-OUTPUT_DIR="${ROOT_PATH}/output/LM/${0}/${timestamp}/"
+OUTPUT_DIR="${ROOT_PATH}/output/LM/${0}/${timestamp}"
 
 mkdir -p "${OUTPUT_DIR}"
 rsync -avh $0 "${OUTPUT_DIR}"
