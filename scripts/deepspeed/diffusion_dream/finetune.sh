@@ -6,13 +6,13 @@ set -x
 SEQ_LENGTH="$1"
 if [ -z "$SEQ_LENGTH" ]
 then
-    SEQ_LENGTH=1024
+    SEQ_LENGTH=3072
 fi
 
 timestamp="$2"
 if [ -z "$timestamp" ]
 then
-    timestamp=`date +'%Y%m%d_%H'`0000
+    timestamp=`date +'%Y%m%d_%H%s'`
 fi
 
 ######################################################################
@@ -56,6 +56,15 @@ rsync -avh "${DATA_PATH}" "${OUTPUT_DIR}"
 
 ######################################################################
 export NCCL_NVLS_ENABLE=0
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=COLL,INIT,GRAPH
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_SHOW_CPP_STACKTRACES=1
+export TORCH_NCCL_DESYNC_DEBUG=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=120
 
 DISTRIBUTED_ARGS="
     --nproc_per_node 8 \

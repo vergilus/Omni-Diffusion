@@ -42,11 +42,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalized_text(path: Path) -> str:
-    """Read a LibriTTS normalized transcript and collapse incidental whitespace."""
-    return " ".join(path.read_text(encoding="utf-8").split())
-
-
 def iter_wavs(root: Path, split_patterns: list[str]):
     """Yield wave files in a deterministic order without scanning a split twice."""
     seen = set()
@@ -66,8 +61,8 @@ def make_record(wav_path: Path, input_root: Path, relative_audio_paths: bool) ->
     if not transcript_path.is_file():
         return None
 
-    text = normalized_text(transcript_path)
-    if not text:
+    text = " ".join(transcript_path.read_text(encoding="utf-8").split()) # normalize whitespace
+    if not text or len(text.split()) > 70:
         return None
 
     audio_path = str(wav_path.relative_to(input_root) if relative_audio_paths else wav_path)
@@ -128,7 +123,7 @@ def main() -> int:
     temporary_path.replace(output)
     print(
         "Wrote {written} records to {output}; scanned {wav_seen} wavs, "
-        "skipped {missing_normalized_text} missing and {empty_normalized_text} empty normalized transcripts.".format(
+        "skipped {missing_normalized_text} missing and {empty_normalized_text} empty or oversized transcripts.".format(
             output=output,
             written=stats["written"],
             wav_seen=stats["wav_seen"],
