@@ -25,15 +25,15 @@ cd ${CODE_PATH}
 source "${CODE_PATH}/scripts/set_env_ds_gpu.sh"
 
 ######################################################################
-OUTPUT_DIR="${ROOT_PATH}/output/LM/${0}/${timestamp}"
+OUTPUT_DIR="${ROOT_PATH}/output/${timestamp}"
 
 mkdir -p "${OUTPUT_DIR}"
 rsync -avh $0 "${OUTPUT_DIR}"
 
-export HF_HOME="${ROOT_PATH}/data/HF_HOME_node${INDEX}/"
+export HF_HOME="${ROOT_PATH}/data/HF_HOME_node${INDEX}"
 mkdir -p "${HF_HOME}"
 
-export TRITON_CACHE_DIR="${CODE_PATH}"
+export TRITON_CACHE_DIR="${ROOT_PATH}/cache_out"
 
 export PYTHONPATH="${PYTHONPATH}:${CODE_PATH}/third_party/GLM-4-Voice:${CODE_PATH}/third_party/GLM-4-Voice/third_party/Matcha-TTS/"
 
@@ -47,10 +47,10 @@ echo ${@}
 ######################################################################
 DATA_PATH="${ROOT_PATH}/data/finetune.yaml"
 
-MODEL_NAME_OR_PATH="${ROOT_PATH}/models/Omni-Diffusion"
+MODEL_NAME_OR_PATH="${ROOT_PATH}/models/omni-diffusion"
 AUDIO_TOKENIZER_PATH="${ROOT_PATH}/models/THUDM/glm-4-voice-tokenizer"
 AUDIO_MODEL_NAME_OR_PATH="${ROOT_PATH}/models/FunAudioLLM/SenseVoiceSmall/model.pt"
-IMAGE_TOKENIZER_PATH="${ROOT_PATH}/models/magvitv2"
+IMAGE_TOKENIZER_PATH="${ROOT_PATH}/models/showlab/magvitv2"
 
 rsync -avh "${DATA_PATH}" "${OUTPUT_DIR}"
 
@@ -71,6 +71,7 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.p
     --do_train \
     --config_name "${CODE_PATH}/omni_diffusion/models/dream/config_dream_resume.json" \
     --tokenizer_name "${MODEL_NAME_OR_PATH}" \
+    --cache_dir "${TRITON_CACHE_DIR}" \
     --model_name_or_path "${MODEL_NAME_OR_PATH}" \
     --audio_model_name_or_path "${AUDIO_MODEL_NAME_OR_PATH}" \
     --audio_tokenizer_path "${AUDIO_TOKENIZER_PATH}" \
