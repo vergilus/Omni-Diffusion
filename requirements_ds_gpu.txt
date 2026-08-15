@@ -8,10 +8,11 @@ matplotlib
 einops
 pybind11
 tensorboardX
-pyarrow
+pyarrow==17.0
 transformers==4.51.3
-deepspeed
-accelerate>=1.1.1
+deepspeed==0.16.0
+accelerate==1.1.1
+datasets
 timm
 flask
 flask_restful

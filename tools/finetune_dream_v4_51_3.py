@@ -345,11 +345,11 @@ def load_tokenizer(model_args, data_args, training_args):
             tokenizer.pad_token_id = tokenizer.pad_id
         else:
             tokenizer.pad_token_id = tokenizer.eod_id
-    
+
     logger.info(f"{tokenizer.__class__.__name__=} {len(tokenizer)=}")
     tokenizer = update_tokenizer(tokenizer, model_args.audio_tokenizer_type)
     tokenizer = update_tokenizer_for_magvitv2(tokenizer)
-    logger.info(f"{tokenizer.__class__.__name__=} {len(tokenizer)=}") 
+    logger.info(f"{tokenizer.__class__.__name__=} {len(tokenizer)=}")
 
     return tokenizer
 
@@ -447,7 +447,6 @@ def enable_gradient_checkpointing(model_args, data_args, training_args, config, 
         model.model._set_gradient_checkpointing()
 
         logger.info(f"Enabling gradient checkpointing")
-    
     logger.info(f"model {model}")
 
     return model
@@ -490,7 +489,7 @@ def get_compute_metrics(model_args, data_args, training_args):
         labels = labels[:, 1:].reshape(-1)
         preds = preds[:, :-1].reshape(-1)
         return metric.compute(predictions=preds, references=labels)
-    
+
     return compute_metrics
 
 
@@ -594,7 +593,7 @@ def main():
 
     # Load tokenizer
     tokenizer = load_tokenizer(model_args, data_args, training_args)
-    
+
     # Load model
     model, loading_info = load_model(model_args, data_args, training_args, config, tokenizer)
     model = freeze_model_params(model_args, data_args, training_args, config, tokenizer, model)
@@ -628,7 +627,7 @@ def main():
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
-        
+
         compute_metrics = get_compute_metrics(model_args, data_args, training_args)
 
 

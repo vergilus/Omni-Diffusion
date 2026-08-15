@@ -1047,9 +1047,14 @@ class Trainer(HFTrainer):
                         and self.accelerator.distributed_type != DistributedType.DEEPSPEED
                         else contextlib.nullcontext
                     )
-                    with context():
-                        tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
-
+                    try:
+                        with context():
+                            tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                    except Exception as e:
+                        logger.error(f"Error at training step {self.state.global_step}\n{inputs}")
+                        logger.error(f"Exception: {e}")
+                        print(f"Error at training step {self.state.global_step}\n{inputs}")
+                        return
                     cur_input_text = self.processing_class.decode(inputs['input_ids'][0])
                     cur_task_name = get_task_from_inputs(cur_input_text)
                     

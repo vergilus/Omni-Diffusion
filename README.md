@@ -37,6 +37,7 @@ git submodule update --init --recursive
 pip install -r requirements_ds_gpu.txt
 pip install -e .
 ```
+python==3.12.3
 
 ### Prepare Pre-trained Weight
 
