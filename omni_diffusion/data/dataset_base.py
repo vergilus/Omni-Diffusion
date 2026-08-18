@@ -329,16 +329,15 @@ def load_json_B(data_file):
 
 def load_json_C(data_file):
     from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
-
     raw_data = []
     with open(data_file, "r") as f:
         for line in f.readlines():
             d = json.loads(line)
-            # raw_data.append({"conversations": d["conversations"], "id": d["id"]})
-            if "conversations" in d:
-                raw_data.append({"conversations": d["conversations"]})
-            if "messages" in d:
-                raw_data.append({"messages": d["messages"]})
+            raw_data.append(d)
+            # if "conversations" in d:
+            #     raw_data.append({"conversations": d["conversations"]})
+            # if "messages" in d:
+            #     raw_data.append({"messages": d["messages"]})
     this_data = Dataset.from_list(raw_data)
     return this_data
 
@@ -348,10 +347,10 @@ def load_json(data_file, output_dir):
         try:
             this_data = func(data_file)
             return this_data
-        except Exception as error:
+        except Exception:
             with open(os.path.join(output_dir, "data_error.log"), "a") as f:
                 print("-" * 100, file=f)
-                print(f"{data_file=}", file=f)
+                print(f"{func.__name__}failed: {data_file=}", file=f)
                 # print(error, file=f)
                 print(traceback.format_exc(), file=f)
             continue

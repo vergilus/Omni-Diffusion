@@ -8,6 +8,9 @@ matplotlib
 einops
 pybind11
 tensorboardX
+bitsandbytes
+opencv-python
+rich
 pyarrow==17.0
 transformers==4.51.3
 deepspeed==0.16.0

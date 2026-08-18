@@ -719,6 +719,15 @@ class Trainer(HFTrainer):
 
         return batch_samples, num_items_in_batch
 
+    def _get_common_packed_batch_count(self, local_batch_count, device):
+        """Return the smallest number of valid packed batches across ranks."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return local_batch_count
+
+        batch_count = torch.tensor(local_batch_count, dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(batch_count, op=torch.distributed.ReduceOp.MIN)
+        return batch_count.item()
+
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -962,7 +971,11 @@ class Trainer(HFTrainer):
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
-        for epoch in range(epochs_trained, num_train_epochs):
+        # Packing can turn a different number of raw samples on every rank into
+        # a different number of valid batches.  `max_steps`, not the raw
+        # DataLoader length, must therefore control training termination.
+        epoch = epochs_trained
+        while epoch < args.num_train_epochs and self.state.global_step < max_steps:
             epoch_dataloader = train_dataloader
             if hasattr(epoch_dataloader, "set_epoch"):
                 epoch_dataloader.set_epoch(epoch)
@@ -991,18 +1004,29 @@ class Trainer(HFTrainer):
 
             step = -1
             epoch_iterator = iter(epoch_dataloader)
-            # We chunkify the epoch iterator into gradient accumulation steps `n` batches
-            remainder = num_examples % args.gradient_accumulation_steps
-            if remainder == 0:
-                remainder = args.gradient_accumulation_steps
+            # We chunkify the epoch iterator into full accumulation groups.
+            # `steps_in_epoch` counts raw samples and is not reliable for packed batches,
+            # so a partial packed group is dropped below rather than synchronized.
             update_step = -1
             total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
             if args.gradient_accumulation_steps == 1:
                 total_updates -= 1
             for _ in range(total_updates):
                 update_step += 1
-                num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
+                num_batches = args.gradient_accumulation_steps
                 batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches, args.device)
+                common_batch_count = self._get_common_packed_batch_count(len(batch_samples), args.device)
+                if common_batch_count < num_batches:
+                    if common_batch_count > 0 or len(batch_samples) > 0:
+                        logger.info(
+                            "Dropping incomplete packed accumulation group at epoch %d: "
+                            "local_batches=%d, common_batches=%d, required_batches=%d",
+                            epoch,
+                            len(batch_samples),
+                            common_batch_count,
+                            num_batches,
+                        )
+                    break
                 for i, inputs in enumerate(batch_samples):
                     step += 1
                     do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
@@ -1054,7 +1078,7 @@ class Trainer(HFTrainer):
                         logger.error(f"Error at training step {self.state.global_step}\n{inputs}")
                         logger.error(f"Exception: {e}")
                         print(f"Error at training step {self.state.global_step}\n{inputs}")
-                        return
+                        raise
                     cur_input_text = self.processing_class.decode(inputs['input_ids'][0])
                     cur_task_name = get_task_from_inputs(cur_input_text)
                     
@@ -1177,6 +1201,7 @@ class Trainer(HFTrainer):
                     )
             if self.control.should_training_stop:
                 break
+            epoch += 1
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training

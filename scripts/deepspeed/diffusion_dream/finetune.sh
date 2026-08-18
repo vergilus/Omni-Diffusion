@@ -24,6 +24,11 @@ cd ${CODE_PATH}
 ######################################################################
 source "${CODE_PATH}/scripts/set_env_ds_gpu.sh"
 
+# CUDA 13 rejects the GCC 14 Conda cross-compiler when DeepSpeed JIT-builds
+# FusedAdam.  Use the host GCC 11 toolchain, which is supported by this CUDA.
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+
 ######################################################################
 OUTPUT_DIR="${ROOT_PATH}/output/${timestamp}"
 
@@ -56,15 +61,15 @@ rsync -avh "${DATA_PATH}" "${OUTPUT_DIR}"
 
 ######################################################################
 export NCCL_NVLS_ENABLE=0
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=COLL,INIT,GRAPH
+# export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=COLL,INIT,GRAPH
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export TORCH_SHOW_CPP_STACKTRACES=1
-export TORCH_NCCL_DESYNC_DEBUG=1
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
-export TORCH_NCCL_DUMP_ON_TIMEOUT=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=120
+# export TORCH_NCCL_DESYNC_DEBUG=1
+# export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
+# export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+# export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=60
+# export TORCH_SHOW_CPP_STACKTRACES=1
 
 DISTRIBUTED_ARGS="
     --nproc_per_node 8 \
@@ -97,8 +102,8 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.p
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --save_strategy "steps" \
-    --save_steps 600 \
-    --save_total_limit 100 \
+    --save_steps 500 \
+    --save_total_limit 4 \
     --learning_rate 1.00e-5 \
     --max_grad_norm 1.0 \
     --weight_decay 0.0 \
