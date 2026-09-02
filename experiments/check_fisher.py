@@ -1,14 +1,17 @@
-"""Measure Fisher-Rao spacetime diagnostics on the training data.
+"""Measure Fisher-Rao spacetime intervals on training-like data.
 
 The script uses the same Qwen2Dataset preprocessing as training. For every
-packed item it constructs a nested family of masked states, evaluates the
-model only at supervised target positions, and records endpoint/intermediate
-Fisher-Rao distances, theta-clock velocities, per-position-summed Minkowski
-intervals, path length, geodesicity, and a numerical triangle-inequality check.
+packed item it constructs masked states online, evaluates the model only at
+supervised target positions, and accumulates adjacent-step Fisher-Rao
+intervals. CPU memory is bounded by small scalar sums; only the current and
+previous probability pair is retained on the model device, and complete time
+trajectories are never retained.
 
-This is an analysis script, not a generation script. The endpoint distance is
-only a boundary measurement; the intermediate path makes the spacetime
-diagnostics falsifiable.
+For data-parallel execution, launch the same script with torchrun, for example
+``torchrun --standalone --nproc_per_node=8 experiments/check_fisher.py ...``.
+Each rank owns one full model copy and a strided training-data view; rank 0
+merges only small per-task/per-interval scalar summaries after local Fisher
+calculations finish.
 """
 
 import argparse
@@ -18,6 +21,7 @@ import logging
 import os
 import random
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -50,7 +54,44 @@ LOGGER = logging.getLogger("check_fisher")
 MASK_TOKEN_ID = 151666
 IGNORE_TOKEN_ID = -100
 AUDIO_TOKEN_COUNT = 16384
+IMAGE_TOKEN_COUNT = 8192
 EPS = 1e-12
+
+
+def distributed_context() -> Dict[str, int]:
+    """Read torchrun metadata without initializing a process group."""
+    return {
+        "rank": int(os.environ.get("RANK", "0")),
+        "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+    }
+
+
+def init_distributed(context: Dict[str, int]) -> None:
+    """Initialize one process per GPU when launched through torchrun."""
+    world_size = context["world_size"]
+    if world_size <= 1:
+        return
+    if torch.distributed.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    init_kwargs = {
+        "backend": backend,
+        "rank": context["rank"],
+        "world_size": world_size,
+        "timeout": timedelta(hours=2),
+    }
+    if backend == "nccl":
+        # Tell NCCL the exact local device instead of making it infer one from
+        # the global rank. This is important on multi-process, multi-node jobs.
+        init_kwargs["device_id"] = torch.device(
+            "cuda", context["local_rank"]
+        )
+    torch.distributed.init_process_group(**init_kwargs)
+
+
+def is_main_process(context: Dict[str, int]) -> bool:
+    return context["rank"] == 0
 
 
 def set_seed(seed: int) -> None:
@@ -109,36 +150,110 @@ def fisher_rao_distance(
     )
 
 
-def sequence_fisher_distance(token_distances: torch.Tensor) -> torch.Tensor:
-    """Fisher distance on the product (mean-field) simplex."""
-    return torch.sqrt(token_distances.float().square().sum()).clamp_min(0.0)
+def _new_task_interval_stats(num_intervals: int) -> Dict:
+    """Create scalar accumulators for one task, indexed by time interval."""
+    zeros = lambda: [0.0] * num_intervals
+    counts = lambda: [0] * num_intervals
+    return {
+        "num_samples": 0,
+        "target_position_count": 0,
+        "sequence_interval_sum": zeros(),
+        "sequence_interval_squared_sum": zeros(),
+        "sequence_interval_negative_count": counts(),
+        "sequence_distance_sum": zeros(),
+        "sequence_distance_squared_sum": zeros(),
+        "local_interval_sum": zeros(),
+        "local_interval_squared_sum": zeros(),
+        "local_token_count": counts(),
+        "local_interval_negative_count": counts(),
+        "sample_interval_mean_sum": 0.0,
+        "sample_interval_mean_squared_sum": 0.0,
+        "sample_path_length_sum": 0.0,
+        "sample_path_length_squared_sum": 0.0,
+    }
 
 
-def aggregate_interval(
-    token_distances: torch.Tensor,
+def _merge_task_interval_stats(destination: Dict, source: Dict) -> None:
+    """Add one rank/batch accumulator into another in place."""
+    if destination["num_samples"] == 0 and destination["target_position_count"] == 0:
+        destination.update({
+            key: (list(value) if isinstance(value, list) else value)
+            for key, value in source.items()
+        })
+        return
+    for key, value in source.items():
+        if isinstance(value, list):
+            if len(destination[key]) != len(value):
+                raise ValueError(f"interval accumulator length mismatch for {key}")
+            for index, item in enumerate(value):
+                destination[key][index] += item
+        elif key in destination:
+            destination[key] += value
+        else:
+            destination[key] = value
+
+
+def _merge_rank_summaries(destination: Dict, source: Dict) -> None:
+    """Merge rank-local scalar summaries without loading sample trajectories."""
+    destination["num_samples"] += int(source.get("num_samples", 0))
+    for task, source_stats in source.get("by_task", {}).items():
+        task_stats = destination["by_task"].setdefault(
+            task, _new_task_interval_stats(len(source_stats["sequence_interval_sum"]))
+        )
+        _merge_task_interval_stats(task_stats, source_stats)
+
+
+@torch.inference_mode()
+def fisher_interval_statistics(
+    previous: torch.Tensor,
+    current: torch.Tensor,
     delta_time: float,
     c: float,
-) -> torch.Tensor:
-    """Sum one 1+1 interval per prediction position.
+    row_chunk_size: int = 256,
+) -> Dict[str, float]:
+    """Compute one interval using bounded row temporaries.
 
-    The sequence spatial term is ``sum_j ds_j^2``. Its matching temporal
-    term is ``sum_j c^2 dt^2``, not one shared ``c^2 dt^2`` term.
+    ``previous`` and ``current`` are the only trajectory tensors retained by
+    the caller. Fisher angles are reduced chunk by chunk, so this function
+    never materializes a full ``[target_positions]`` distance vector.
     """
-    token_distances = token_distances.float()
-    return token_distances.numel() * (c * delta_time) ** 2 - token_distances.square().sum()
+    if previous.shape != current.shape or previous.ndim != 2:
+        raise ValueError("Fisher interval inputs must have shape [targets, vocab]")
+    if row_chunk_size < 1:
+        raise ValueError("row_chunk_size must be positive")
+    target_count = int(previous.shape[0])
+    if target_count == 0:
+        raise ValueError("Fisher interval requires at least one target")
 
+    distance_squared_sum = 0.0
+    local_interval_sum = 0.0
+    local_interval_squared_sum = 0.0
+    local_negative_count = 0
+    temporal_per_token = (c * float(delta_time)) ** 2
+    for start in range(0, target_count, row_chunk_size):
+        stop = min(start + row_chunk_size, target_count)
+        distances = fisher_rao_distance(previous[start:stop], current[start:stop])
+        distances = distances.float()
+        squared = distances.square()
+        local_interval = temporal_per_token - squared
+        distance_squared_sum += float(squared.sum())
+        local_interval_sum += float(local_interval.sum())
+        local_interval_squared_sum += float(local_interval.square().sum())
+        local_negative_count += int((local_interval < 0).sum())
+        del distances, squared, local_interval
 
-def factorized_joint_distance(
-    first: torch.Tensor, second: torch.Tensor, eps: float = EPS
-) -> torch.Tensor:
-    """Distance of the factorized joint distribution, reported for reference."""
-    first = first.float().clamp_min(0)
-    second = second.float().clamp_min(0)
-    first = first / first.sum(dim=-1, keepdim=True).clamp_min(eps)
-    second = second / second.sum(dim=-1, keepdim=True).clamp_min(eps)
-    affinity = (first.sqrt() * second.sqrt()).sum(dim=-1).clamp_min(eps)
-    joint_affinity = torch.exp(torch.log(affinity).sum()).clamp(0.0, 1.0)
-    return 2.0 * torch.acos(joint_affinity)
+    sequence_distance = distance_squared_sum**0.5
+    sequence_interval = target_count * temporal_per_token - distance_squared_sum
+    return {
+        "target_count": target_count,
+        "sequence_distance": sequence_distance,
+        "sequence_interval": sequence_interval,
+        "sequence_interval_squared": sequence_interval**2,
+        "sequence_interval_negative": float(sequence_interval < 0),
+        "local_interval_sum": local_interval_sum,
+        "local_interval_squared_sum": local_interval_squared_sum,
+        "local_negative_count": local_negative_count,
+    }
 
 
 def theta_from_alpha(alpha: torch.Tensor) -> torch.Tensor:
@@ -146,8 +261,87 @@ def theta_from_alpha(alpha: torch.Tensor) -> torch.Tensor:
     return 2.0 * torch.acos(alpha.clamp(0.0, 1.0).sqrt())
 
 
-def _as_float(value: torch.Tensor) -> float:
-    return float(value.detach().cpu().item())
+def _as_audio_list(value) -> List[torch.Tensor]:
+    if value is None:
+        return []
+    if torch.is_tensor(value):
+        return list(value) if value.ndim > 1 else [value]
+    return list(value)
+
+
+def _as_audio_index_list(value) -> List[torch.Tensor]:
+    if value is None:
+        return []
+    if torch.is_tensor(value):
+        return list(value) if value.ndim >= 3 else [value]
+    return list(value)
+
+
+def collate_analysis_states(states: Sequence[Dict]) -> Dict:
+    """Stack fixed-length packed states and offset their audio batch rows."""
+    if not states:
+        raise ValueError("cannot collate an empty analysis batch")
+
+    def stack_field(name: str, default_factory):
+        values = []
+        for state in states:
+            value = state.get(name)
+            if value is None:
+                value = default_factory(state["input_ids"])
+            value = torch.as_tensor(value).view(-1)
+            values.append(value)
+        lengths = {value.numel() for value in values}
+        if len(lengths) != 1:
+            raise ValueError(f"analysis batch has inconsistent {name} lengths")
+        return torch.stack(values, dim=0)
+
+    input_ids = stack_field("input_ids", lambda value: value)
+    attention_mask = stack_field(
+        "attention_mask", lambda value: torch.ones_like(value)
+    )
+    position_ids = stack_field(
+        "position_ids", lambda value: torch.arange(value.numel())
+    )
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+    audios = []
+    audio_indices = []
+    for sample_index, state in enumerate(states):
+        sample_audios = _as_audio_list(state.get("audios"))
+        sample_indices = _as_audio_index_list(state.get("audio_indices"))
+        if len(sample_audios) != len(sample_indices):
+            raise ValueError(
+                "analysis batch audio and audio_indices lengths do not match"
+            )
+        audios.extend(sample_audios)
+        for indices in sample_indices:
+            indices = torch.as_tensor(indices).clone()
+            if indices.ndim < 2 or indices.shape[0] != 2:
+                raise ValueError("audio_indices must have leading shape [2, ...]")
+            indices[0].fill_(sample_index)
+            audio_indices.append(indices)
+    if audios:
+        batch["audios"] = audios
+        batch["audio_indices"] = audio_indices
+    return batch
+
+
+def packed_block_attention_mask(
+    attention_mask: torch.Tensor, position_ids: torch.Tensor
+) -> torch.Tensor:
+    """Build Dream's [batch, 1, length, length] packed attention mask."""
+    if attention_mask.ndim != 2 or position_ids.ndim != 2:
+        raise ValueError("packed mask inputs must have shape [batch, length]")
+    is_new = position_ids == 0
+    segment_id = torch.cumsum(is_new.long(), dim=1) - 1
+    block_mask = (
+        segment_id.unsqueeze(1) == segment_id.unsqueeze(2)
+    ).long()
+    return (block_mask * attention_mask.unsqueeze(-1)).to(torch.bool).unsqueeze(1)
 
 
 class FisherAnalyzer:
@@ -164,6 +358,7 @@ class FisherAnalyzer:
         torch_dtype: torch.dtype,
         load_image_tokenizer: bool = False,
         audio_tokenizer_rank: Optional[int] = None,
+        image_tokenizer_rank: Optional[int] = None,
     ):
         config = DreamConfig.from_pretrained(model_name_or_path)
         tokenizer = AutoTokenizer.from_pretrained(
@@ -173,7 +368,7 @@ class FisherAnalyzer:
         if audio_tokenizer_type is not None:
             tokenizer = update_tokenizer(tokenizer, audio_tokenizer_type)
         tokenizer.add_tokens(
-            [f"<|image_{index}|>" for index in range(8192)],
+            [f"<|image_{index}|>" for index in range(IMAGE_TOKEN_COUNT)],
             special_tokens=False,
         )
         if tokenizer.pad_token_id is None:
@@ -213,7 +408,9 @@ class FisherAnalyzer:
             min_patch_grid=1,
             max_patch_grid=12,
         )
-        self.image_processor.image_tokenizer.rank = 0 if torch.cuda.is_available() else None
+        self.image_processor.image_tokenizer.rank = (
+            image_tokenizer_rank if torch.cuda.is_available() else None
+        )
         if load_image_tokenizer:
             self.image_processor.load_model()
         else:
@@ -259,31 +456,50 @@ class FisherAnalyzer:
         return {key: value for key, value in kwargs.items() if value is not None}
 
     @torch.inference_mode()
-    def target_probabilities(
+    def target_probabilities_batch(
         self,
         state: Dict,
-        prediction_positions: torch.Tensor,
+        prediction_positions: Sequence[torch.Tensor],
         chunk_size: int,
-    ) -> torch.Tensor:
-        """Run one encoding forward and return distributions at target rows.
+    ) -> List[torch.Tensor]:
+        """Return target-row distributions on the model device.
 
-        Dream's public forward materializes a vocabulary projection for every
-        sequence row. The analysis only needs the causal rows immediately
-        before supervised labels, so use the base transformer output and apply
-        ``lm_head`` to those rows in chunks. The fallback keeps this helper
-        usable with small test doubles that expose only ``forward``.
+        Keeping this one step's tensor on-device avoids a large CPU transfer;
+        :meth:`analyze_batch` releases it as soon as the adjacent interval is
+        reduced.
         """
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
-        prediction_positions = prediction_positions.long()
+        if not prediction_positions:
+            raise ValueError("prediction_positions cannot be empty")
+
+        positions_by_sample = [
+            torch.as_tensor(positions).view(-1).long()
+            for positions in prediction_positions
+        ]
+        if any(positions.numel() == 0 for positions in positions_by_sample):
+            raise ValueError("every batch sample must have prediction positions")
+
         kwargs = self.forward_kwargs(state)
-        if prediction_positions.numel() == 0:
-            raise ValueError("no prediction positions")
-        if (
-            prediction_positions.min() < 0
-            or prediction_positions.max() >= kwargs["input_ids"].shape[1]
-        ):
-            raise IndexError("prediction position is outside the input sequence")
+        input_ids = kwargs["input_ids"]
+        if input_ids.shape[0] != len(positions_by_sample):
+            raise ValueError("prediction position batch size does not match input_ids")
+        sequence_length = input_ids.shape[1]
+        for positions in positions_by_sample:
+            if positions.min() < 0 or positions.max() >= sequence_length:
+                raise IndexError("prediction position is outside the input sequence")
+
+        counts = [positions.numel() for positions in positions_by_sample]
+        flat_batch = torch.cat(
+            [
+                torch.full((count,), sample_index, dtype=torch.long)
+                for sample_index, count in enumerate(counts)
+            ]
+        )
+        flat_positions = torch.cat(positions_by_sample)
+        # Preserve fisher_chunk_size as a per-sample setting. A batch of B
+        # samples projects up to B times as many target rows per lm_head call.
+        effective_chunk_size = chunk_size * len(positions_by_sample)
 
         base_model = getattr(self.model, "model", None)
         if (
@@ -291,45 +507,58 @@ class FisherAnalyzer:
             and hasattr(base_model, "forward")
             and hasattr(self.model, "get_output_embeddings")
         ):
-            # Match DreamModel.forward's packed-sequence block mask before
-            # calling DreamBaseModel directly.
             attention_mask = kwargs["attention_mask"]
-            position_ids = kwargs["position_ids"]
-            is_new = position_ids == 0
-            segment_id = torch.cumsum(is_new.long(), dim=1) - 1
-            block_mask = (
-                segment_id.unsqueeze(1) == segment_id.unsqueeze(2)
-            ).long()
-            kwargs["attention_mask"] = block_mask * attention_mask.unsqueeze(-1)
+            if attention_mask.ndim == 2:
+                kwargs["attention_mask"] = packed_block_attention_mask(
+                    attention_mask, kwargs["position_ids"]
+                )
+            elif attention_mask.ndim != 4:
+                raise ValueError("attention_mask must have shape [B,L] or [B,1,L,L]")
             encoding = base_model(**kwargs)
-            hidden_states = encoding.last_hidden_state[0]
+            hidden_states = encoding.last_hidden_state
             lm_head = self.model.get_output_embeddings()
             lm_head_device = lm_head.weight.device
-            probabilities = []
-            for start in range(0, prediction_positions.numel(), chunk_size):
-                positions = prediction_positions[start : start + chunk_size].to(
-                    hidden_states.device
-                )
-                rows = hidden_states.index_select(0, positions).to(lm_head_device)
-                probabilities.append(
-                    torch.softmax(lm_head(rows).float(), dim=-1).cpu()
-                )
-            del encoding, hidden_states
-            return torch.cat(probabilities, dim=0)
-
-        # Small fake models used by static/CPU tests may not expose the
-        # DreamBaseModel split. Their public logits path is still correct.
-        output = self.model(**kwargs)
-        logits = output.logits[0]
-        chunks = []
-        for start in range(0, prediction_positions.numel(), chunk_size):
-            positions = prediction_positions[start : start + chunk_size].to(
-                logits.device
+            row_batch = flat_batch.to(hidden_states.device)
+            row_positions = flat_positions.to(hidden_states.device)
+            rows = hidden_states[row_batch, row_positions].to(lm_head_device)
+            vocab_size = int(lm_head.weight.shape[0])
+            flat_probabilities = torch.empty(
+                rows.shape[0],
+                vocab_size,
+                dtype=torch.float32,
+                device=lm_head_device,
             )
-            rows = logits.index_select(0, positions).float()
-            chunks.append(torch.softmax(rows, dim=-1).cpu())
-        del output, logits
-        return torch.cat(chunks, dim=0)
+            for start in range(0, rows.shape[0], effective_chunk_size):
+                stop = min(start + effective_chunk_size, rows.shape[0])
+                flat_probabilities[start:stop].copy_(
+                    torch.softmax(lm_head(rows[start:stop]).float(), dim=-1)
+                )
+            del encoding, hidden_states, rows
+        else:
+            output = self.model(**kwargs)
+            logits = output.logits
+            row_batch = flat_batch.to(logits.device)
+            row_positions = flat_positions.to(logits.device)
+            rows = logits[row_batch, row_positions]
+            flat_probabilities = torch.empty(
+                rows.shape[0],
+                rows.shape[-1],
+                dtype=torch.float32,
+                device=rows.device,
+            )
+            for start in range(0, rows.shape[0], effective_chunk_size):
+                stop = min(start + effective_chunk_size, rows.shape[0])
+                flat_probabilities[start:stop].copy_(
+                    torch.softmax(rows[start:stop].float(), dim=-1)
+                )
+            del output, logits, rows
+
+        probabilities = []
+        offset = 0
+        for count in counts:
+            probabilities.append(flat_probabilities[offset : offset + count])
+            offset += count
+        return probabilities
 
     def classify_target(self, batch: Dict, labels: torch.Tensor) -> str:
         target_ids = labels[labels.ne(IGNORE_TOKEN_ID)]
@@ -344,18 +573,19 @@ class FisherAnalyzer:
             return "ASR"
         return "text"
 
-    def analyze_item(
+    def prepare_item(
         self,
         batch: Dict,
-        sample_index: int,
-        output_dir: str,
         num_time_steps: int,
         time_grid: str,
-        fisher_chunk_size: int,
-        c: float,
         mask_seed: int,
-        save_distributions: bool,
     ) -> Dict:
+        """Prepare the clean sequence and deterministic mask trajectory.
+
+        States are constructed by :meth:`state_at` just before each forward;
+        keeping all ``num_time_steps`` copies here would needlessly consume
+        CPU memory for long trajectories.
+        """
         input_ids = batch["input_ids"].detach().cpu().long()
         labels = batch["labels"].detach().cpu().long()
         if input_ids.ndim != 1 or labels.ndim != 1:
@@ -394,232 +624,221 @@ class FisherAnalyzer:
             alpha = torch.linspace(1.0, 0.0, num_time_steps)
             theta = theta_from_alpha(alpha)
 
-        masks = []
-        states = []
-        for alpha_value in alpha:
-            state_mask = target_mask & (mask_scores >= alpha_value)
-            state_ids = clean_input.clone()
-            state_ids[state_mask] = MASK_TOKEN_ID
-            masks.append(state_mask)
-            states.append(state_ids)
-
         base_state = {
             key: value
             for key, value in batch.items()
             if key not in {"input_ids", "labels", "images", "image_indices"}
         }
-        prediction_positions = target_positions - 1
-        probabilities = []
-        state_nll = []
-        target_ids = labels[target_positions]
-        for state_ids in states:
-            probability = self.target_probabilities(
-                dict(base_state, input_ids=state_ids),
-                prediction_positions,
-                fisher_chunk_size,
-            )
-            probabilities.append(probability)
-            target_probability = probability.gather(1, target_ids[:, None]).squeeze(1)
-            state_nll.append(float((-target_probability.clamp_min(EPS).log()).mean()))
-
-        interval_rows = []
-        token_distances_by_step = []
-        for step in range(1, num_time_steps):
-            token_distances = fisher_rao_distance(
-                probabilities[step - 1], probabilities[step]
-            )
-            token_distances_by_step.append(token_distances)
-            delta_theta = float(theta[step] - theta[step - 1])
-            active_target = (masks[step - 1] | masks[step])[target_positions]
-            active_distances = (
-                token_distances[active_target]
-                if active_target.any()
-                else token_distances
-            )
-            ds_sequence = sequence_fisher_distance(token_distances)
-            ds_active = sequence_fisher_distance(active_distances)
-            target_count = token_distances.numel()
-            active_count = int(active_target.sum())
-            active_metric_count = active_distances.numel()
-            active_rms_count = max(active_metric_count, 1)
-            sequence_distance_rms = _as_float(ds_sequence) / max(
-                target_count, 1
-            ) ** 0.5
-            active_distance_rms = _as_float(ds_active) / active_rms_count**0.5
-            local_speed = token_distances / max(delta_theta, EPS)
-            sequence_speed = _as_float(ds_sequence) / max(delta_theta, EPS)
-            local_interval = c**2 * delta_theta**2 - token_distances.square()
-            sequence_interval = aggregate_interval(
-                token_distances, delta_theta, c
-            )
-            active_interval = aggregate_interval(
-                active_distances, delta_theta, c
-            )
-            sequence_interval_value = _as_float(sequence_interval)
-            active_interval_value = _as_float(active_interval)
-            interval_rows.append(
-                {
-                    "step": step,
-                    "alpha_start": float(alpha[step - 1]),
-                    "alpha_end": float(alpha[step]),
-                    "theta_start": float(theta[step - 1]),
-                    "theta_end": float(theta[step]),
-                    "delta_theta": delta_theta,
-                    "masked_target_count": int(masks[step].sum()),
-                    "active_target_count": int(active_target.sum()),
-                    "fisher_distance_sequence": _as_float(ds_sequence),
-                    "fisher_distance_active": _as_float(ds_active),
-                    # RMS values are length diagnostics only. The raw
-                    # sequence distance above remains the geometric quantity.
-                    "fisher_distance_sequence_rms": sequence_distance_rms,
-                    "fisher_distance_active_rms": active_distance_rms,
-                    "local_speed_max": _as_float(local_speed.max()),
-                    "sequence_speed": sequence_speed,
-                    "sequence_speed_rms": sequence_distance_rms
-                    / max(delta_theta, EPS),
-                    "local_interval_min": _as_float(
-                        local_interval.min()
-                    ),
-                    "local_interval_negative_fraction": float(
-                        (local_interval < 0).float().mean()
-                    ),
-                    # The sequence interval is the sum of per-position
-                    # intervals, so its temporal term scales with N.
-                    "sequence_time_metric": target_count
-                    * (c * delta_theta) ** 2,
-                    "sequence_interval": sequence_interval_value,
-                    "sequence_interval_rms": sequence_interval_value
-                    / max(target_count, 1),
-                    "active_time_metric": active_metric_count
-                    * (c * delta_theta) ** 2,
-                    "active_metric_count": active_metric_count,
-                    "active_interval": active_interval_value,
-                    "active_interval_rms": active_interval_value
-                    / max(active_metric_count, 1),
-                }
-            )
-
-        endpoint_token_distances = fisher_rao_distance(
-            probabilities[0], probabilities[-1]
-        )
-        endpoint_distance = sequence_fisher_distance(endpoint_token_distances)
-        endpoint_joint_distance = factorized_joint_distance(
-            probabilities[0], probabilities[-1]
-        )
-        path_length = sum(row["fisher_distance_sequence"] for row in interval_rows)
-        endpoint_distance_value = _as_float(endpoint_distance)
-        target_count = endpoint_token_distances.numel()
-        endpoint_interval = aggregate_interval(
-            endpoint_token_distances,
-            float(theta[-1] - theta[0]),
-            c,
-        )
-        endpoint_interval_value = _as_float(endpoint_interval)
-
-        triangle_violations = []
-        for step in range(num_time_steps - 2):
-            d02 = sequence_fisher_distance(
-                fisher_rao_distance(probabilities[step], probabilities[step + 2])
-            )
-            d01 = sequence_fisher_distance(token_distances_by_step[step])
-            d12 = sequence_fisher_distance(token_distances_by_step[step + 1])
-            triangle_violations.append(_as_float(d02 - d01 - d12))
-
-        sequence_intervals = [row["sequence_interval"] for row in interval_rows]
-        sequence_interval_rms_values = [
-            row["sequence_interval_rms"] for row in interval_rows
-        ]
-        active_intervals = [row["active_interval"] for row in interval_rows]
-        active_interval_rms_values = [
-            row["active_interval_rms"] for row in interval_rows
-        ]
-        local_speeds = [row["local_speed_max"] for row in interval_rows]
-        required_c = max(
-            (row["sequence_speed_rms"] for row in interval_rows),
-            default=0.0,
-        )
-        required_c_raw = max(
-            (row["sequence_speed"] for row in interval_rows),
-            default=0.0,
-        )
-        sequence_speed_rms_max = max(
-            (row["sequence_speed_rms"] for row in interval_rows),
-            default=0.0,
-        )
-        result = {
-            "sample_index": sample_index,
-            "task": self.classify_target(batch, labels),
-            "num_target_positions": int(target_positions.numel()),
-            "target_positions": target_positions.tolist(),
-            "target_token_ids": target_ids.tolist(),
-            "time_grid": time_grid,
-            "num_time_steps": num_time_steps,
+        return {
+            "batch": batch,
+            "labels": labels,
+            "target_mask": target_mask,
+            "clean_input": clean_input,
+            "mask_scores": mask_scores,
+            "target_positions": target_positions,
+            "target_ids": labels[target_positions],
+            "alpha": alpha,
+            "theta": theta,
+            "base_state": base_state,
+            "prediction_positions": target_positions - 1,
             "mask_seed": mask_seed,
-            "fisher_clock_endpoint": float(theta[-1] - theta[0]),
-            "fisher_rao_distance": endpoint_distance_value,
-            "fisher_rao_sequence_distance": endpoint_distance_value,
-            "fisher_rao_sequence_distance_rms": endpoint_distance_value
-            / max(target_positions.numel(), 1) ** 0.5,
-            "fisher_rao_joint_distance": _as_float(endpoint_joint_distance),
-            "endpoint_time_metric": target_count
-            * (c * float(theta[-1] - theta[0])) ** 2,
-            "endpoint_interval": endpoint_interval_value,
-            "endpoint_interval_rms": endpoint_interval_value
-            / max(target_count, 1),
-            "fisher_rao_path_length": path_length,
-            "geodesicity_ratio": path_length / max(endpoint_distance_value, EPS),
-            "interval_c": c,
-            "sequence_interval_min": min(sequence_intervals),
-            "sequence_interval_rms_min": min(sequence_interval_rms_values),
-            "sequence_interval_negative_fraction": sum(
-                value < 0 for value in sequence_intervals
-            )
-            / len(sequence_intervals),
-            "required_sequence_c_max": required_c,
-            "required_sequence_c_raw_max": required_c_raw,
-            "sequence_speed_rms_max": sequence_speed_rms_max,
-            "local_speed_max": max(local_speeds),
-            "active_interval_min": min(active_intervals),
-            "active_interval_rms_min": min(active_interval_rms_values),
-            "local_interval_min": min(
-                row["local_interval_min"] for row in interval_rows
-            ),
-            "local_interval_negative_fraction_mean": sum(
-                row["local_interval_negative_fraction"]
-                for row in interval_rows
-            )
-            / len(interval_rows),
-            "triangle_violation_max": max(triangle_violations, default=0.0),
-            "triangle_violation_count": sum(
-                value > 1e-5 for value in triangle_violations
-            ),
-            "state_nll": state_nll,
-            "intervals": interval_rows,
+            "task": self.classify_target(batch, labels),
         }
 
-        if save_distributions:
-            distribution_path = Path(output_dir) / f"fisher_{sample_index:06d}.pt"
-            torch.save(
-                {
-                    # Only endpoint distributions are persisted. Intermediate
-                    # states are used for local interval/path diagnostics but
-                    # are intentionally not duplicated on disk.
-                    "prob_0": probabilities[0],
-                    "prob_T": probabilities[-1],
-                    "x_0": states[0],
-                    "x_T": states[-1],
-                    "alpha": alpha,
-                    "theta": theta,
-                    "target_positions": target_positions,
-                    "target_token_ids": target_ids,
-                },
-                distribution_path,
+    @staticmethod
+    def state_at(prepared: Dict, step: int) -> torch.Tensor:
+        """Materialize one masked state on CPU for the next model forward."""
+        alpha_value = prepared["alpha"][step]
+        state_mask = prepared["target_mask"] & (
+            prepared["mask_scores"] >= alpha_value
+        )
+        state_ids = prepared["clean_input"].clone()
+        state_ids[state_mask] = MASK_TOKEN_ID
+        return state_ids
+
+    def analyze_batch(
+        self,
+        batches: Sequence[Dict],
+        sample_indices: Sequence[int],
+        output_dir: str,
+        num_time_steps: int,
+        time_grid: str,
+        fisher_chunk_size: int,
+        c: float,
+        mask_seeds: Sequence[int],
+        save_distributions: bool,
+    ) -> Dict:
+        """Analyze a batch while retaining only adjacent-step probabilities.
+
+        The returned interval accumulators are small (``O(num_time_steps)``)
+        and are merged by task. No historical probability trajectory is kept.
+        """
+        if not (
+            len(batches) == len(sample_indices) == len(mask_seeds)
+        ):
+            raise ValueError("analysis batch metadata lengths do not match")
+        if not batches:
+            return {"num_samples": 0, "samples": [], "by_task": {}}
+
+        prepared_items = [
+            self.prepare_item(batch, num_time_steps, time_grid, mask_seed)
+            for batch, mask_seed in zip(batches, mask_seeds)
+        ]
+        # Audio features and packed metadata do not change with diffusion
+        # time. Move them once per analysis batch instead of copying them at
+        # every step; dynamic input_ids remain inexpensive CPU tensors.
+        for item in prepared_items:
+            item["base_state"] = {
+                key: _move_nested(value, self.model_device)
+                for key, value in item["base_state"].items()
+            }
+        num_intervals = num_time_steps - 1
+        by_task = {
+            task: _new_task_interval_stats(num_intervals)
+            for task in {item["task"] for item in prepared_items}
+        }
+        sample_interval_sums = [[0.0] * num_intervals for _ in prepared_items]
+        sample_path_lengths = [0.0] * len(prepared_items)
+        sample_negative_counts = [[0] * num_intervals for _ in prepared_items]
+        first_probabilities = None
+        previous_probabilities = None
+        static_batch = collate_analysis_states(
+            [
+                dict(item["base_state"], input_ids=item["clean_input"])
+                for item in prepared_items
+            ]
+        )
+        static_batch["attention_mask"] = packed_block_attention_mask(
+            static_batch["attention_mask"], static_batch["position_ids"]
+        )
+        for step in range(num_time_steps):
+            state_batch = dict(static_batch)
+            state_batch["input_ids"] = torch.stack(
+                [self.state_at(item, step) for item in prepared_items], dim=0
             )
-            result["distribution_path"] = str(distribution_path)
-        return result
+            step_probabilities = self.target_probabilities_batch(
+                state_batch,
+                [item["prediction_positions"] for item in prepared_items],
+                fisher_chunk_size,
+            )
+            if step == 0:
+                previous_probabilities = step_probabilities
+                if save_distributions:
+                    first_probabilities = list(step_probabilities)
+                del state_batch
+                continue
+
+            delta_theta = float(
+                prepared_items[0]["theta"][step]
+                - prepared_items[0]["theta"][step - 1]
+            )
+            for item_index, (item, previous, current) in enumerate(
+                zip(prepared_items, previous_probabilities, step_probabilities)
+            ):
+                stats = fisher_interval_statistics(
+                    previous,
+                    current,
+                    delta_theta,
+                    c,
+                    # Probability softmax chunks control projection peak
+                    # memory; larger Fisher row chunks avoid Python-loop
+                    # overhead while keeping reduction temporaries bounded.
+                    row_chunk_size=max(fisher_chunk_size, 256),
+                )
+                task_stats = by_task[item["task"]]
+                interval_index = step - 1
+                task_stats["sequence_interval_sum"][interval_index] += stats[
+                    "sequence_interval"
+                ]
+                task_stats["sequence_interval_squared_sum"][interval_index] += stats[
+                    "sequence_interval_squared"
+                ]
+                task_stats["sequence_interval_negative_count"][interval_index] += int(
+                    stats["sequence_interval_negative"]
+                )
+                task_stats["sequence_distance_sum"][interval_index] += stats[
+                    "sequence_distance"
+                ]
+                task_stats["sequence_distance_squared_sum"][interval_index] += (
+                    stats["sequence_distance"] ** 2
+                )
+                task_stats["local_interval_sum"][interval_index] += stats[
+                    "local_interval_sum"
+                ]
+                task_stats["local_interval_squared_sum"][interval_index] += stats[
+                    "local_interval_squared_sum"
+                ]
+                task_stats["local_token_count"][interval_index] += stats[
+                    "target_count"
+                ]
+                task_stats["local_interval_negative_count"][interval_index] += stats[
+                    "local_negative_count"
+                ]
+                sample_interval_sums[item_index][interval_index] = stats[
+                    "sequence_interval"
+                ]
+                sample_negative_counts[item_index][interval_index] = int(
+                    stats["sequence_interval_negative"]
+                )
+                sample_path_lengths[item_index] += stats["sequence_distance"]
+
+            old_previous = previous_probabilities
+            previous_probabilities = step_probabilities
+            del old_previous, state_batch
+
+        samples = []
+        for item_index, (item, sample_index) in enumerate(
+            zip(prepared_items, sample_indices)
+        ):
+            task_stats = by_task[item["task"]]
+            interval_mean = sum(sample_interval_sums[item_index]) / num_intervals
+            negative_fraction = sum(sample_negative_counts[item_index]) / num_intervals
+            path_length = sample_path_lengths[item_index]
+            task_stats["num_samples"] += 1
+            task_stats["target_position_count"] += int(
+                item["target_positions"].numel()
+            )
+            task_stats["sample_interval_mean_sum"] += interval_mean
+            task_stats["sample_interval_mean_squared_sum"] += interval_mean**2
+            task_stats["sample_path_length_sum"] += path_length
+            task_stats["sample_path_length_squared_sum"] += path_length**2
+            result = {
+                "sample_index": int(sample_index),
+                "task": item["task"],
+                "num_target_positions": int(item["target_positions"].numel()),
+                "time_grid": time_grid,
+                "num_time_steps": num_time_steps,
+                "mask_seed": int(item["mask_seed"]),
+                "sequence_interval_mean": interval_mean,
+                "sequence_interval_negative_fraction": negative_fraction,
+                "fisher_rao_path_length": path_length,
+            }
+            if save_distributions:
+                if first_probabilities is None or previous_probabilities is None:
+                    raise RuntimeError("endpoint probabilities were not produced")
+                distribution_path = Path(output_dir) / f"fisher_{sample_index:06d}.pt"
+                torch.save(
+                    {
+                        "prob_0": first_probabilities[item_index].cpu(),
+                        "prob_T": previous_probabilities[item_index].cpu(),
+                        "x_0": self.state_at(item, 0),
+                        "x_T": self.state_at(item, num_time_steps - 1),
+                        "alpha": item["alpha"],
+                        "theta": item["theta"],
+                        "target_positions": item["target_positions"],
+                        "target_token_ids": item["target_ids"],
+                    },
+                    distribution_path,
+                )
+                result["distribution_path"] = str(distribution_path)
+            samples.append(result)
+
+        del previous_probabilities, first_probabilities, static_batch
+        return {"num_samples": len(samples), "samples": samples, "by_task": by_task}
 
 
 def build_training_dataset(analyzer: FisherAnalyzer, args) -> Qwen2Dataset:
+    dataset_output_dir = getattr(args, "dataset_output_dir", args.output_dir)
     dataset = Qwen2Dataset(
         args.dataset_name,
         analyzer.tokenizer,
@@ -627,7 +846,7 @@ def build_training_dataset(analyzer: FisherAnalyzer, args) -> Qwen2Dataset:
         image_token_length=args.image_token_length,
         max_padding_length=args.model_max_length,
         variable_length=False,
-        output_dir=args.output_dir,
+        output_dir=dataset_output_dir,
         shift_token=False,
         create_position_ids=True,
         create_attention_mask=True,
@@ -654,105 +873,410 @@ def build_training_dataset(analyzer: FisherAnalyzer, args) -> Qwen2Dataset:
     return dataset
 
 
-def summarize_results(results: Sequence[Dict]) -> Dict:
-    summary = {"num_samples": len(results), "by_task": {}}
-    for task in sorted({result["task"] for result in results}):
-        subset = [result for result in results if result["task"] == task]
+def _safe_mean(sum_value: float, count: int) -> float:
+    return float(sum_value) / max(int(count), 1)
 
-        def mean(key: str) -> float:
-            return sum(float(item[key]) for item in subset) / len(subset)
 
-        summary["by_task"][task] = {
-            "num_samples": len(subset),
-            "fisher_rao_distance_mean": mean("fisher_rao_distance"),
-            "fisher_rao_sequence_distance_rms_mean": mean(
-                "fisher_rao_sequence_distance_rms"
-            ),
-            "fisher_rao_joint_distance_mean": mean("fisher_rao_joint_distance"),
-            "endpoint_interval_mean": mean("endpoint_interval"),
-            "endpoint_interval_rms_mean": mean("endpoint_interval_rms"),
-            "fisher_rao_path_length_mean": mean("fisher_rao_path_length"),
-            "geodesicity_ratio_mean": mean("geodesicity_ratio"),
-            "sequence_interval_min_mean": mean("sequence_interval_min"),
-            "sequence_interval_rms_min_mean": mean(
-                "sequence_interval_rms_min"
-            ),
-            "sequence_interval_negative_fraction_mean": mean(
-                "sequence_interval_negative_fraction"
-            ),
-            "required_sequence_c_max_mean": mean("required_sequence_c_max"),
-            "required_sequence_c_raw_max_mean": mean(
-                "required_sequence_c_raw_max"
-            ),
-            "sequence_speed_rms_max_mean": mean("sequence_speed_rms_max"),
-            "local_speed_max_mean": mean("local_speed_max"),
-            "active_interval_min_mean": mean("active_interval_min"),
-            "active_interval_rms_min_mean": mean("active_interval_rms_min"),
-            "local_interval_min_mean": mean("local_interval_min"),
-            "local_interval_negative_fraction_mean": mean(
-                "local_interval_negative_fraction_mean"
-            ),
-            "triangle_violation_count": sum(
-                item["triangle_violation_count"] for item in subset
-            ),
+def _safe_std(sum_value: float, squared_sum: float, count: int) -> float:
+    count = int(count)
+    if count < 1:
+        return 0.0
+    mean = float(sum_value) / count
+    return max(float(squared_sum) / count - mean * mean, 0.0) ** 0.5
+
+
+def finalize_rank_summary(
+    rank_summary: Dict,
+    num_time_steps: int,
+    time_grid: str,
+    c: float,
+    requested_num_samples: int,
+) -> Dict:
+    """Convert raw sums into compact, task-separated interval statistics."""
+    if time_grid == "theta":
+        theta = torch.linspace(0.0, torch.pi, num_time_steps)
+        alpha = torch.cos(theta / 2.0).square()
+        alpha[0], alpha[-1] = 1.0, 0.0
+    else:
+        alpha = torch.linspace(1.0, 0.0, num_time_steps)
+        theta = theta_from_alpha(alpha)
+    intervals_meta = [
+        {
+            "interval_index": index,
+            "step": index + 1,
+            "alpha_start": float(alpha[index]),
+            "alpha_end": float(alpha[index + 1]),
+            "theta_start": float(theta[index]),
+            "theta_end": float(theta[index + 1]),
+            "delta_theta": float(theta[index + 1] - theta[index]),
+            "time_metric_per_target": c**2
+            * float(theta[index + 1] - theta[index]) ** 2,
         }
-    return summary
-
-
-def run_analysis(analyzer: FisherAnalyzer, args) -> List[Dict]:
-    dataset = build_training_dataset(analyzer, args)
-    max_items = args.max_dataset_items or len(dataset)
-    results = []
-    with mask_all_supervised_positions():
-        for data_index in range(max_items):
-            batch = dataset[data_index]
-            # Packed datasets may return {} while their source-local buffer is
-            # filling; continue consuming raw records until a packed item is
-            # available.
-            if "input_ids" not in batch or "labels" not in batch:
-                continue
-            try:
-                result = analyzer.analyze_item(
-                    batch,
-                    sample_index=len(results),
-                    output_dir=args.output_dir,
-                    num_time_steps=args.num_time_steps,
-                    time_grid=args.time_grid,
-                    fisher_chunk_size=args.fisher_chunk_size,
-                    c=args.c,
-                    mask_seed=args.seed + len(results),
-                    save_distributions=args.save_distributions,
-                )
-            except (RuntimeError, ValueError, IndexError) as error:
-                LOGGER.warning("Skipping raw dataset item %d: %s", data_index, error)
-                continue
-            results.append(result)
-            LOGGER.info(
-                "sample=%d task=%s targets=%d endpoint=%f path=%f interval_min=%f",
-                result["sample_index"],
-                result["task"],
-                result["num_target_positions"],
-                result["fisher_rao_distance"],
-                result["fisher_rao_path_length"],
-                result["sequence_interval_min"],
+        for index in range(num_time_steps - 1)
+    ]
+    output = {
+        "num_samples": min(int(rank_summary.get("num_samples", 0)), requested_num_samples),
+        "requested_num_samples": requested_num_samples,
+        "num_time_steps": num_time_steps,
+        "num_intervals": num_time_steps - 1,
+        "time_grid": time_grid,
+        "interval_c": c,
+        "interval_definition": (
+            "sum_j[(c*delta_theta)^2 - dF_j^2], with j over supervised "
+            "prediction positions only"
+        ),
+        "by_task": {},
+    }
+    for task, stats in sorted(rank_summary.get("by_task", {}).items()):
+        num_samples = int(stats["num_samples"])
+        intervals = []
+        for index, metadata in enumerate(intervals_meta):
+            count = num_samples
+            token_count = int(stats["local_token_count"][index])
+            sequence_mean = _safe_mean(
+                stats["sequence_interval_sum"][index], count
             )
-            if len(results) >= args.num_samples:
+            distance_mean = _safe_mean(
+                stats["sequence_distance_sum"][index], count
+            )
+            local_mean = _safe_mean(
+                stats["local_interval_sum"][index], token_count
+            )
+            interval = dict(metadata)
+            interval.update(
+                {
+                    "sample_count": count,
+                    "target_position_count": token_count,
+                    "sequence_interval_mean": sequence_mean,
+                    "sequence_interval_std": _safe_std(
+                        stats["sequence_interval_sum"][index],
+                        stats["sequence_interval_squared_sum"][index],
+                        count,
+                    ),
+                    "sequence_interval_negative_fraction": _safe_mean(
+                        stats["sequence_interval_negative_count"][index], count
+                    ),
+                    "sequence_fisher_distance_mean": distance_mean,
+                    "sequence_fisher_distance_std": _safe_std(
+                        stats["sequence_distance_sum"][index],
+                        stats["sequence_distance_squared_sum"][index],
+                        count,
+                    ),
+                    "local_interval_mean": local_mean,
+                    "local_interval_std": _safe_std(
+                        stats["local_interval_sum"][index],
+                        stats["local_interval_squared_sum"][index],
+                        token_count,
+                    ),
+                    "local_interval_negative_fraction": _safe_mean(
+                        stats["local_interval_negative_count"][index], token_count
+                    ),
+                }
+            )
+            intervals.append(interval)
+        output["by_task"][task] = {
+            "num_samples": num_samples,
+            "target_position_count": int(stats["target_position_count"]),
+            "target_positions_mean": _safe_mean(
+                stats["target_position_count"], num_samples
+            ),
+            "sequence_interval_mean": _safe_mean(
+                sum(stats["sequence_interval_sum"]), num_samples * (num_time_steps - 1)
+            ),
+            "sequence_interval_negative_fraction": _safe_mean(
+                sum(stats["sequence_interval_negative_count"]),
+                num_samples * (num_time_steps - 1),
+            ),
+            "sample_sequence_interval_mean": _safe_mean(
+                stats["sample_interval_mean_sum"], num_samples
+            ),
+            "sample_sequence_interval_std": _safe_std(
+                stats["sample_interval_mean_sum"],
+                stats["sample_interval_mean_squared_sum"],
+                num_samples,
+            ),
+            "fisher_rao_path_length_mean": _safe_mean(
+                stats["sample_path_length_sum"], num_samples
+            ),
+            "fisher_rao_path_length_std": _safe_std(
+                stats["sample_path_length_sum"],
+                stats["sample_path_length_squared_sum"],
+                num_samples,
+            ),
+            "intervals": intervals,
+        }
+    return output
+
+
+def _process_rank_results(
+    analyzer: FisherAnalyzer,
+    args,
+    context: Dict[str, int],
+    local_output_dir: Path,
+) -> Dict:
+    """Process this rank's strided records and persist scalar accumulators."""
+    dataset = build_training_dataset(analyzer, args)
+    rank = context["rank"]
+    world_size = context["world_size"]
+    raw_item_limit = args.max_dataset_items
+    if raw_item_limit is None:
+        max_items = len(dataset)
+    else:
+        # Qwen2Dataset emits a packed item only after its source-local buffer
+        # overflows. Under torchrun, a global limit of N would give each rank
+        # only N/world_size records and can leave every buffer unfinished.
+        # Treat an explicit limit as a per-rank scan budget, while still
+        # clamping the actual global raw range to the dataset length.
+        if world_size > 1:
+            raw_item_limit *= world_size
+        max_items = min(raw_item_limit, len(dataset))
+    analysis_batch_size = max(
+        int(getattr(args, "analysis_batch_size", 1)), 1
+    )
+    can_batch = analysis_batch_size > 1 and hasattr(
+        analyzer, "analyze_batch"
+    )
+    # The requested size is an upper bound. If a real batch does not fit, the
+    # rank remembers the smaller size for subsequent groups instead of paying
+    # for the same failed forward on every iteration.
+    effective_batch_size = analysis_batch_size
+    LOGGER.info(
+        "[rank %d] analysis_batch_size=%d",
+        rank,
+        analysis_batch_size,
+    )
+    # Start with an even quota. If malformed/empty records make the global
+    # count too small, all ranks take another quota-sized pass below.
+    local_quota = args.num_samples // world_size + int(
+        rank < (args.num_samples % world_size)
+    )
+    rank_summary = {"rank": rank, "num_samples": 0, "by_task": {}}
+    next_index = rank
+    next_sample_index = 0
+
+    def log_result(result: Dict) -> None:
+        LOGGER.info(
+            "[rank %d] sample=%d task=%s targets=%d path=%f interval_mean=%f",
+            rank,
+            result["sample_index"],
+            result["task"],
+            result["num_target_positions"],
+            result["fisher_rao_path_length"],
+            result["sequence_interval_mean"],
+        )
+
+    def analyze_pending(pending: Sequence[tuple[int, Dict]]) -> None:
+        nonlocal effective_batch_size, next_sample_index
+        if not pending:
+            return
+        def analyze_group(group: Sequence[tuple[int, Dict]]) -> None:
+            """Analyze a group, bisecting it when batching is not viable."""
+            nonlocal effective_batch_size, next_sample_index
+            if not group:
+                return
+
+            if can_batch and len(group) > 1:
+                data_indices = [data_index for data_index, _ in group]
+                try:
+                    batch_result = analyzer.analyze_batch(
+                        batches=[batch for _, batch in group],
+                        sample_indices=list(range(next_sample_index, next_sample_index + len(group))),
+                        output_dir=str(local_output_dir),
+                        num_time_steps=args.num_time_steps,
+                        time_grid=args.time_grid,
+                        fisher_chunk_size=args.fisher_chunk_size,
+                        c=args.c,
+                        mask_seeds=[args.seed + index for index in data_indices],
+                        save_distributions=args.save_distributions,
+                    )
+                    if len(batch_result["samples"]) != len(group):
+                        raise ValueError(
+                            "analyze_batch returned a different number of results"
+                        )
+                    _merge_rank_summaries(rank_summary, batch_result)
+                    for result in batch_result["samples"]:
+                        log_result(result)
+                    next_sample_index += len(group)
+                    return
+                except (RuntimeError, ValueError, IndexError) as error:
+                    # A batch can exceed available memory or contain records
+                    # with incompatible metadata. Bisect it so compatible
+                    # samples still run together, and remember OOM-derived
+                    # capacity for later groups.
+                    LOGGER.warning(
+                        "[rank %d] Batch size %d failed (%s); splitting the "
+                        "group",
+                        rank,
+                        len(group),
+                        error,
+                    )
+                    if isinstance(error, RuntimeError) and "out of memory" in str(error).lower():
+                        effective_batch_size = max(
+                            1, min(effective_batch_size, len(group) // 2)
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    LOGGER.warning(
+                        "[rank %d] Effective analysis batch size is now %d",
+                        rank,
+                        effective_batch_size,
+                    )
+                    midpoint = len(group) // 2
+                    analyze_group(group[:midpoint])
+                    analyze_group(group[midpoint:])
+                    return
+
+            for data_index, batch in group:
+                sample_index = next_sample_index
+                try:
+                    batch_result = analyzer.analyze_batch(
+                        batches=[batch],
+                        sample_indices=[sample_index],
+                        output_dir=str(local_output_dir),
+                        num_time_steps=args.num_time_steps,
+                        time_grid=args.time_grid,
+                        fisher_chunk_size=args.fisher_chunk_size,
+                        c=args.c,
+                        mask_seeds=[args.seed + data_index],
+                        save_distributions=args.save_distributions,
+                    )
+                    result = batch_result["samples"][0]
+                except (RuntimeError, ValueError, IndexError) as error:
+                    LOGGER.warning(
+                        "[rank %d] Skipping raw dataset item %d: %s",
+                        rank,
+                        data_index,
+                        error,
+                    )
+                    if isinstance(error, RuntimeError) and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                _merge_rank_summaries(rank_summary, batch_result)
+                next_sample_index += 1
+                log_result(result)
+
+        for start in range(0, len(pending), max(effective_batch_size, 1)):
+            analyze_group(pending[start : start + max(effective_batch_size, 1)])
+
+    with mask_all_supervised_positions():
+        while True:
+            pending = []
+            while next_index < max_items and rank_summary["num_samples"] < local_quota:
+                data_index = next_index
+                next_index += world_size
+                batch = dataset[data_index]
+                # Packed datasets may return {} while their source-local buffer
+                # is filling; continue consuming raw records until a packed
+                # item is available.
+                if "input_ids" not in batch or "labels" not in batch:
+                    continue
+                pending.append((data_index, batch))
+                if (
+                    len(pending) >= analysis_batch_size
+                    or rank_summary["num_samples"] + len(pending) >= local_quota
+                    or next_index >= max_items
+                ):
+                    analyze_pending(pending)
+                    pending = []
+
+            if pending:
+                analyze_pending(pending)
+
+            exhausted = next_index >= max_items
+            if world_size <= 1 or not torch.distributed.is_initialized():
                 break
 
-    if not results:
+            counts = [None] * world_size
+            exhausted_flags = [None] * world_size
+            torch.distributed.all_gather_object(counts, rank_summary["num_samples"])
+            torch.distributed.all_gather_object(exhausted_flags, exhausted)
+            total_count = sum(int(count) for count in counts)
+            if total_count >= args.num_samples or all(exhausted_flags):
+                break
+            remaining = args.num_samples - total_count
+            active_ranks = [
+                index for index, exhausted_flag in enumerate(exhausted_flags)
+                if not exhausted_flag
+            ]
+            if remaining <= 0 or rank not in active_ranks:
+                local_quota = rank_summary["num_samples"]
+            else:
+                active_position = active_ranks.index(rank)
+                local_quota += remaining // len(active_ranks) + int(
+                    active_position < (remaining % len(active_ranks))
+                )
+
+    rank_summary["rank"] = rank
+    with (local_output_dir / "rank_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(rank_summary, handle, ensure_ascii=False)
+    LOGGER.info(
+        "[rank %d] Wrote scalar summary for %d samples to %s",
+        rank,
+        rank_summary["num_samples"],
+        local_output_dir,
+    )
+    return rank_summary
+
+
+def run_analysis(analyzer: FisherAnalyzer, args) -> Dict:
+    """Run local analysis and merge only scalar rank summaries on rank 0."""
+    context = {
+        "rank": int(getattr(args, "rank", 0)),
+        "world_size": int(getattr(args, "world_size", 1)),
+        "local_rank": int(getattr(args, "local_rank", 0)),
+    }
+    output_dir = Path(args.output_dir)
+    local_output_dir = Path(
+        getattr(
+            args,
+            "local_output_dir",
+            output_dir
+            / f"rank_{context['rank']:05d}"
+            if context["world_size"] > 1
+            else output_dir,
+        )
+    )
+    args.dataset_output_dir = str(local_output_dir)
+    local_summary = _process_rank_results(
+        analyzer, args, context, local_output_dir
+    )
+
+    if context["world_size"] <= 1 or not torch.distributed.is_initialized():
+        merged_summary = local_summary
+    else:
+        # Probability tensors remain on the rank that produced them. Only the
+        # small per-interval scalar files are read by rank 0 after the barrier.
+        torch.distributed.barrier()
+        if not is_main_process(context):
+            return local_summary
+        merged_summary = {
+            "num_samples": 0,
+            "by_task": {},
+        }
+        for rank in range(context["world_size"]):
+            rank_dir = output_dir / f"rank_{rank:05d}"
+            summary_path = rank_dir / "rank_summary.json"
+            if not summary_path.exists():
+                raise RuntimeError(f"Missing rank summary file: {summary_path}")
+            with summary_path.open("r", encoding="utf-8") as handle:
+                _merge_rank_summaries(merged_summary, json.load(handle))
+
+    if not merged_summary.get("num_samples"):
         raise RuntimeError(
             "No complete training item was produced; increase --max_dataset_items "
             "or inspect the dataset error log."
         )
-    output_dir = Path(args.output_dir)
-    with (output_dir / "fisher_results.jsonl").open("w", encoding="utf-8") as handle:
-        for result in results:
-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-    summary = summarize_results(results)
+    summary = finalize_rank_summary(
+        merged_summary,
+        num_time_steps=args.num_time_steps,
+        time_grid=args.time_grid,
+        c=args.c,
+        requested_num_samples=args.num_samples,
+    )
     with (output_dir / "fisher_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
-    LOGGER.info("Wrote %d samples to %s", len(results), output_dir)
-    return results
+    LOGGER.info("Wrote scalar Fisher summary for %d samples to %s", summary["num_samples"], output_dir)
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -790,8 +1314,22 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "bfloat16", "float16", "float32"),
         default="auto",
     )
-    parser.add_argument("--num_samples", type=int, default=1)
-    parser.add_argument("--max_dataset_items", type=int, default=None)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=128,
+        help="Global number of valid sample packs across all ranks.",
+    )
+    parser.add_argument(
+        "--max_dataset_items",
+        type=int,
+        default=None,
+        help=(
+            "Raw scan budget. Single-GPU uses a global index limit; under "
+            "torchrun this many records are assigned to each rank so packed "
+            "buffers can fill."
+        ),
+    )
     parser.add_argument("--model_max_length", type=int, default=3072)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--image_token_length", type=int, default=1025)
@@ -815,8 +1353,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_time_steps",
         type=int,
-        default=5,
-        help="Nested masked states, including alpha=1 and alpha=0.",
+        default=100,
+        help="Number of online masked states, including alpha=1 and alpha=0.",
     )
     parser.add_argument(
         "--time_grid",
@@ -827,8 +1365,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fisher_chunk_size",
         type=int,
-        default=16,
+        default=256,
         help="Target rows per probability softmax chunk.",
+    )
+    parser.add_argument(
+        "--analysis_batch_size",
+        type=int,
+        default=8,
+        help=(
+            "Number of packed samples processed together by each rank. "
+            "Larger values increase per-GPU utilization and memory; reduce "
+            "this value if a batch runs out of memory."
+        ),
     )
     parser.add_argument(
         "--c",
@@ -839,7 +1387,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_distributions",
         action="store_true",
-        help="Save endpoint [target_position,vocab] float32 prob_0/prob_T tensors.",
+        help=(
+            "Save endpoint [target_position,vocab] float32 prob_0/prob_T "
+            "tensors; this intentionally retains one extra endpoint copy."
+        ),
     )
     args = parser.parse_args()
     if args.num_samples < 1:
@@ -852,6 +1403,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num_time_steps must be at least 2")
     if args.fisher_chunk_size < 1:
         parser.error("--fisher_chunk_size must be positive")
+    if args.analysis_batch_size < 1:
+        parser.error("--analysis_batch_size must be positive")
     if args.c <= 0:
         parser.error("--c must be positive")
     return args
@@ -859,14 +1412,42 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # export LD_LIBRARY_PATH=/share/users/zouwei/miniconda3/envs/dev/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    context = distributed_context()
+    if context["world_size"] < 1:
+        raise RuntimeError("WORLD_SIZE must be positive")
+    if context["world_size"] > 1 and torch.cuda.is_available():
+        if context["local_rank"] >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={context['local_rank']} is outside the visible "
+                f"CUDA device range 0..{torch.cuda.device_count() - 1}"
+            )
+        torch.cuda.set_device(context["local_rank"])
+    init_distributed(context)
+    args.rank = context["rank"]
+    args.local_rank = context["local_rank"]
+    args.world_size = context["world_size"]
+    output_dir = Path(args.output_dir)
+    if context["world_size"] > 1:
+        args.local_output_dir = str(
+            output_dir / f"rank_{context['rank']:05d}"
+        )
+    else:
+        args.local_output_dir = str(output_dir)
     if str(args.device_map).startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is not visible to this process, but --device_map requests "
             f"{args.device_map}. Run on a GPU allocation (for example an H100) "
             "or pass --device_map cpu for a small test model."
         )
+    if context["world_size"] > 1 and torch.cuda.is_available():
+        # A per-rank full model is data parallel. "auto" would otherwise let
+        # Accelerate shard every rank's model across all visible GPUs.
+        args.device_map = f"cuda:{context['local_rank']}"
     set_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.local_output_dir, exist_ok=True)
+    if context["rank"] == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
     if args.torch_dtype == "auto":
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     else:
@@ -884,9 +1465,18 @@ def main() -> None:
         device_map=args.device_map,
         torch_dtype=dtype,
         load_image_tokenizer=args.load_image_tokenizer,
-        audio_tokenizer_rank=0 if torch.cuda.is_available() else None,
+        audio_tokenizer_rank=(
+            context["local_rank"] if torch.cuda.is_available() else None
+        ),
+        image_tokenizer_rank=(
+            context["local_rank"] if torch.cuda.is_available() else None
+        ),
     )
-    run_analysis(analyzer, args)
+    try:
+        run_analysis(analyzer, args)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
