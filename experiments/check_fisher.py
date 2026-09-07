@@ -53,8 +53,10 @@ from omni_diffusion.tokenizer import get_audio_tokenizer, update_tokenizer
 LOGGER = logging.getLogger("check_fisher")
 MASK_TOKEN_ID = 151666
 IGNORE_TOKEN_ID = -100
-AUDIO_TOKEN_COUNT = 16384
-IMAGE_TOKEN_COUNT = 8192
+# Per-modality codebook sizes. These are not the full shared tokenizer size:
+# Omni-Diffusion uses a 16K audio codebook and an 8K image codebook.
+AUDIO_CODEBOOK_SIZE = 16_384
+IMAGE_CODEBOOK_SIZE = 8_192
 EPS = 1e-12
 
 
@@ -356,7 +358,6 @@ class FisherAnalyzer:
         flow_path: Optional[str],
         device_map: str,
         torch_dtype: torch.dtype,
-        load_image_tokenizer: bool = False,
         audio_tokenizer_rank: Optional[int] = None,
         image_tokenizer_rank: Optional[int] = None,
     ):
@@ -368,7 +369,10 @@ class FisherAnalyzer:
         if audio_tokenizer_type is not None:
             tokenizer = update_tokenizer(tokenizer, audio_tokenizer_type)
         tokenizer.add_tokens(
-            [f"<|image_{index}|>" for index in range(IMAGE_TOKEN_COUNT)],
+            [
+                f"<|image_{index}|>"
+                for index in range(IMAGE_CODEBOOK_SIZE)
+            ],
             special_tokens=False,
         )
         if tokenizer.pad_token_id is None:
@@ -399,7 +403,7 @@ class FisherAnalyzer:
             rank=audio_tokenizer_rank,
         )
 
-        # Qwen2Dataset expects this processor object even for ASR/TTS data.
+        # Qwen2Dataset expects this processor object even for ASR/TTS/VQA data.
         self.image_processor = ImageProcessor(
             image_tokenizer_path,
             "dynamic",
@@ -411,13 +415,10 @@ class FisherAnalyzer:
         self.image_processor.image_tokenizer.rank = (
             image_tokenizer_rank if torch.cuda.is_available() else None
         )
-        if load_image_tokenizer:
-            self.image_processor.load_model()
-        else:
-            # Current ASR/TTS records have no image fields. Avoid loading the
-            # unrelated MAGVIT weights unless an image-containing YAML is used.
-            self.image_processor.image_tokenizer = None
+        self.image_processor.load_model()
+
         self.audio_token_offset = self.tokenizer.convert_tokens_to_ids("<|audio_0|>")
+        self.image_token_offset = self.tokenizer.convert_tokens_to_ids("<|image_0|>")
         LOGGER.info("model_device=%s vocab_size=%d", self.model_device, len(tokenizer))
 
     def forward_kwargs(self, state: Dict) -> Dict:
@@ -560,18 +561,57 @@ class FisherAnalyzer:
             offset += count
         return probabilities
 
-    def classify_target(self, batch: Dict, labels: torch.Tensor) -> str:
-        target_ids = labels[labels.ne(IGNORE_TOKEN_ID)]
-        audio_begin = self.audio_token_offset
-        audio_end = audio_begin + AUDIO_TOKEN_COUNT
-        audio_count = int(
-            ((target_ids >= audio_begin) & (target_ids < audio_end)).sum()
+    def classify_task(
+        self,
+        batch: Dict,
+        clean_input: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> str:
+        """Classify the input/output modality pair at the complete x_0 endpoint."""
+        endpoint_ids = torch.as_tensor(clean_input).detach().cpu().view(-1)
+        target_mask = torch.as_tensor(target_mask).detach().cpu().view(-1).bool()
+        if endpoint_ids.numel() != target_mask.numel():
+            raise ValueError("clean_input and target_mask must have the same length")
+
+        def has_code(ids: torch.Tensor, offset: int, size: int) -> bool:
+            return ids.numel() > 0 and bool(
+                ((ids >= offset) & (ids < offset + size)).any().item()
+            )
+
+        input_ids = endpoint_ids[~target_mask]
+        output_ids = endpoint_ids[target_mask]
+        input_audio = has_code(
+            input_ids, self.audio_token_offset, AUDIO_CODEBOOK_SIZE
+        ) or self._has_payload(batch.get("audios"))
+        input_image = has_code(
+            input_ids, self.image_token_offset, IMAGE_CODEBOOK_SIZE
         )
-        if audio_count:
-            return "TTS"
-        if batch.get("audios"):
+        output_audio = has_code(
+            output_ids, self.audio_token_offset, AUDIO_CODEBOOK_SIZE
+        )
+        output_image = has_code(
+            output_ids, self.image_token_offset, IMAGE_CODEBOOK_SIZE
+        )
+
+        if input_audio and not input_image and not output_audio and not output_image:
             return "ASR"
+        if not input_audio and not input_image and output_audio and not output_image:
+            return "TTS"
+        if input_image and not input_audio and not output_audio and not output_image:
+            return "VQA"
         return "text"
+
+    @staticmethod
+    def _has_payload(value) -> bool:
+        """Return whether a list/tensor payload contains at least one item."""
+        if value is None:
+            return False
+        if torch.is_tensor(value):
+            return value.numel() > 0
+        try:
+            return len(value) > 0
+        except TypeError:
+            return True
 
     def prepare_item(
         self,
@@ -642,7 +682,7 @@ class FisherAnalyzer:
             "base_state": base_state,
             "prediction_positions": target_positions - 1,
             "mask_seed": mask_seed,
-            "task": self.classify_target(batch, labels),
+            "task": self.classify_task(batch, clean_input, target_mask),
         }
 
     @staticmethod
@@ -869,7 +909,7 @@ def build_training_dataset(analyzer: FisherAnalyzer, args) -> Qwen2Dataset:
         use_megatron=False,
     )
     dataset.processor["audio"].audio_tokenizer = analyzer.audio_tokenizer
-    dataset.processor["image"] = analyzer.image_processor
+    dataset.processor["image"].image_tokenizer = analyzer.image_processor.image_tokenizer
     return dataset
 
 
@@ -1281,7 +1321,7 @@ def run_analysis(analyzer: FisherAnalyzer, args) -> Dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fisher-Rao spacetime diagnostics on training-like TTS/ASR data."
+        description="Fisher-Rao spacetime diagnostics on training-like TTS/ASR/VQA data."
     )
     parser.add_argument("--model_name_or_path", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -1297,11 +1337,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio_tokenizer_type", default="sensevoice_glm4voice"
     )
-    parser.add_argument("--image_tokenizer_path", default="showlab/magvitv2")
     parser.add_argument(
-        "--load_image_tokenizer",
-        action="store_true",
-        help="Load MAGVIT weights when the training YAML contains images.",
+        "--image_tokenizer_path",
+        default="/share/users/zouwei/models/showlab/magvitv2"
     )
     parser.add_argument(
         "--flow_path",
@@ -1331,7 +1369,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--model_max_length", type=int, default=3072)
-    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--image_size", type=int, default=256) #短边映射到的分辨率，最后会被qwen dataset 从中心裁切最大512的方块作为输入。
     parser.add_argument("--image_token_length", type=int, default=1025)
     parser.add_argument("--max_num_frame", type=int, default=16)
     parser.add_argument("--max_fps", type=int, default=1)
@@ -1464,7 +1502,6 @@ def main() -> None:
         flow_path=args.flow_path,
         device_map=args.device_map,
         torch_dtype=dtype,
-        load_image_tokenizer=args.load_image_tokenizer,
         audio_tokenizer_rank=(
             context["local_rank"] if torch.cuda.is_available() else None
         ),
@@ -1482,3 +1519,5 @@ def main() -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     main()
+
+# torchrun --standalone --nproc_per_node=8   experiments/check_fisher.py   --model_name_or_path /share/users/zouwei/models/omni-diffusion   --output_dir test_out/fisher_analysis   --dataset_name /share/users/zouwei/data/finetune.yaml   --audio_tokenizer_path /share/users/zouwei/models/THUDM/glm-4-voice-tokenizer   --num_samples 1000   --num_time_steps 500   --time_grid theta   --analysis_batch_size 8   --fisher_chunk_size 128
