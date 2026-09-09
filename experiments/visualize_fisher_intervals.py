@@ -2,9 +2,8 @@
 
 Reads one or more ``fisher_summary*.json`` files produced by
 ``experiments/check_fisher.py`` and writes a single HTML file. Task type
-(ASR / TTS / VQA) is the top-level tab; within each task a second tab row
-switches between the *sequence interval* and the *local interval* views.
-Each view draws one bar per interval (``num_intervals = num_time_steps - 1``).
+(ASR / TTS / VQA) is the top-level tab. Each task draws one sequence-level
+bar per interval (``num_intervals = num_time_steps - 1``).
 The output uses no third-party Python or JavaScript libraries, so it can be
 generated on a headless server and opened in any browser.
 """
@@ -20,14 +19,7 @@ METRICS = {
         "mean": "sequence_interval_mean",
         "std": "sequence_interval_std",
         "negative": "sequence_interval_negative_fraction",
-        "description": "sum_j[(c*delta_theta)^2 - dF_j^2] over supervised positions",
-    },
-    "local": {
-        "label": "Local Interval",
-        "mean": "local_interval_mean",
-        "std": "local_interval_std",
-        "negative": "local_interval_negative_fraction",
-        "description": "per-token (c*delta_theta)^2 - dF_j^2, averaged over tokens",
+        "description": "len*(c*(theta_t-theta_0))^2 - sum_j dF(prob_0, prob_t)_j^2",
     },
 }
 
@@ -66,7 +58,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </header>
 <div class="controls">
   <div class="tabs tasks" id="task-tabs"></div>
-  <div class="tabs" id="metric-tabs"></div>
   <div class="control-group">
     <label for="file-select">Summary:</label>
     <select id="file-select"></select>
@@ -82,7 +73,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 const DATA = JSON.parse(document.getElementById("fisher-data").textContent);
 const METRICS = __METRICS__;
-const state = { task: null, metric: "sequence", fileIndex: 0, logScale: false, showStd: true };
+const state = { task: null, fileIndex: 0, logScale: false, showStd: true };
 
 const svg = document.getElementById("svg");
 const tooltip = document.getElementById("tooltip");
@@ -122,16 +113,6 @@ function buildControls() {
     taskTabs.appendChild(btn);
   }
 
-  const tabs = document.getElementById("metric-tabs");
-  tabs.innerHTML = "";
-  for (const key of Object.keys(METRICS)) {
-    const btn = document.createElement("button");
-    btn.textContent = METRICS[key].label;
-    btn.className = key === state.metric ? "active" : "";
-    btn.onclick = () => { state.metric = key; buildControls(); render(); };
-    tabs.appendChild(btn);
-  }
-
   const sel = document.getElementById("file-select");
   sel.innerHTML = "";
   DATA.forEach((f, i) => {
@@ -147,7 +128,7 @@ function buildControls() {
     `samples=${file.num_samples}  time_steps=${file.num_time_steps}  ` +
     `intervals=${file.num_intervals}  time_grid=${file.time_grid}  c=${file.interval_c}` +
     `  samples(task)=${currentTask() ? currentTask().num_samples : "-"}`;
-  document.getElementById("desc").textContent = METRICS[state.metric].description;
+  document.getElementById("desc").textContent = METRICS.sequence.description;
 }
 
 function niceTicks(min, max, count) {
@@ -165,7 +146,7 @@ function niceTicks(min, max, count) {
 }
 
 function render() {
-  const metric = METRICS[state.metric];
+  const metric = METRICS.sequence;
   const width = svg.clientWidth || 1200;
   const height = 560;
   const margin = { top: 30, right: 24, bottom: 48, left: 110 };
@@ -249,7 +230,7 @@ function render() {
   svg.appendChild(rangeText);
 
   const yLabel = el("text", { x: 16, y: margin.top + plotH / 2, "text-anchor": "middle", class: "axis-label", transform: `rotate(-90 16 ${margin.top + plotH / 2})` });
-  yLabel.textContent = METRICS[state.metric].label + (state.logScale ? " (log scale)" : "");
+  yLabel.textContent = metric.label + (state.logScale ? " (log scale)" : "");
   svg.appendChild(yLabel);
   const xLabel = el("text", { x: margin.left + plotW / 2, y: height - 8, "text-anchor": "middle", class: "axis-label" });
   xLabel.textContent = "interval index (step = interval_index + 1)";
@@ -261,12 +242,16 @@ function render() {
     const iv = task.intervals[i];
     const mean = iv[metric.mean];
     const std = state.showStd ? iv[metric.std] : 0;
+    // Fade intervals with a larger negative-sample fraction while retaining
+    // the task hue. A fully negative interval remains visible at low opacity.
+    const negative = Math.max(0, Math.min(1, Number(iv[metric.negative]) || 0));
+    const opacity = 0.18 + 0.72 * (1 - negative);
     const x = xOf(i) + (slot - barW) / 2;
     const yTop = yOf(mean + std);
     const yBase = yOf(state.logScale ? Math.max(mean, yMin) : yMin);
     const rect = el("rect", {
       x: x, y: yTop, width: barW, height: Math.max(0.5, yBase - yTop),
-      fill: task.color, opacity: 0.85,
+      fill: task.color, opacity: opacity,
     });
     rect.addEventListener("mousemove", ev => showTooltip(ev, i));
     rect.addEventListener("mouseleave", hideTooltip);
@@ -276,7 +261,7 @@ function render() {
   function showTooltip(ev, i) {
     const iv = task.intervals[i];
     tooltip.innerHTML =
-      `<div><b>${task.name}</b> &nbsp; interval ${i + 1} / step ${i + 2}</div>` +
+      `<div><b>${task.name}</b> &nbsp; interval ${i + 1} / step ${iv.step || i + 1}</div>` +
       `<div>mean=${fmt(iv[metric.mean])} &plusmn; ${fmt(iv[metric.std])} ` +
       `(neg ${(iv[metric.negative] * 100).toFixed(2)}%)</div>` +
       `<div>&alpha;: ${iv.alpha_start.toFixed(4)} &rarr; ${iv.alpha_end.toFixed(4)}` +
@@ -388,5 +373,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # python3 tools/visualize_fisher_intervals.py test_out/fisher_analysis/fisher_summary.json -o fisher_interval.html
+    # python experiments/visualize_fisher_intervals.py test_out/fisher_analysis/fisher_summary.json -o  test_out/fisher_interval.html
     main()
