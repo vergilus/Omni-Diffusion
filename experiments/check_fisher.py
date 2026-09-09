@@ -2,10 +2,10 @@
 
 The script uses the same Qwen2Dataset preprocessing as training. For every
 packed item it constructs masked states online, evaluates the model only at
-supervised target positions, and accumulates adjacent-step Fisher-Rao
-intervals. CPU memory is bounded by small scalar sums; only the current and
-previous probability pair is retained on the model device, and complete time
-trajectories are never retained.
+supervised target positions, and accumulates endpoint-conditioned Fisher-Rao
+intervals from x_0 to every x_t. CPU memory is bounded by small scalar sums;
+only the fixed x_0 and current x_t probability pair is retained on the model
+device, and complete time trajectories are never retained.
 
 For data-parallel execution, launch the same script with torchrun, for example
 ``torchrun --standalone --nproc_per_node=8 experiments/check_fisher.py ...``.
@@ -164,10 +164,6 @@ def _new_task_interval_stats(num_intervals: int) -> Dict:
         "sequence_interval_negative_count": counts(),
         "sequence_distance_sum": zeros(),
         "sequence_distance_squared_sum": zeros(),
-        "local_interval_sum": zeros(),
-        "local_interval_squared_sum": zeros(),
-        "local_token_count": counts(),
-        "local_interval_negative_count": counts(),
         "sample_interval_mean_sum": 0.0,
         "sample_interval_mean_squared_sum": 0.0,
         "sample_path_length_sum": 0.0,
@@ -228,21 +224,14 @@ def fisher_interval_statistics(
         raise ValueError("Fisher interval requires at least one target")
 
     distance_squared_sum = 0.0
-    local_interval_sum = 0.0
-    local_interval_squared_sum = 0.0
-    local_negative_count = 0
     temporal_per_token = (c * float(delta_time)) ** 2
     for start in range(0, target_count, row_chunk_size):
         stop = min(start + row_chunk_size, target_count)
         distances = fisher_rao_distance(previous[start:stop], current[start:stop])
         distances = distances.float()
         squared = distances.square()
-        local_interval = temporal_per_token - squared
         distance_squared_sum += float(squared.sum())
-        local_interval_sum += float(local_interval.sum())
-        local_interval_squared_sum += float(local_interval.square().sum())
-        local_negative_count += int((local_interval < 0).sum())
-        del distances, squared, local_interval
+        del distances, squared
 
     sequence_distance = distance_squared_sum**0.5
     sequence_interval = target_count * temporal_per_token - distance_squared_sum
@@ -252,9 +241,6 @@ def fisher_interval_statistics(
         "sequence_interval": sequence_interval,
         "sequence_interval_squared": sequence_interval**2,
         "sequence_interval_negative": float(sequence_interval < 0),
-        "local_interval_sum": local_interval_sum,
-        "local_interval_squared_sum": local_interval_squared_sum,
-        "local_negative_count": local_negative_count,
     }
 
 
@@ -466,7 +452,7 @@ class FisherAnalyzer:
         """Return target-row distributions on the model device.
 
         Keeping this one step's tensor on-device avoids a large CPU transfer;
-        :meth:`analyze_batch` releases it as soon as the adjacent interval is
+        :meth:`analyze_batch` releases it as soon as the endpoint interval is
         reduced.
         """
         if chunk_size < 1:
@@ -708,10 +694,11 @@ class FisherAnalyzer:
         mask_seeds: Sequence[int],
         save_distributions: bool,
     ) -> Dict:
-        """Analyze a batch while retaining only adjacent-step probabilities.
+        """Analyze fixed-reference intervals from x_0 to every masked x_t.
 
         The returned interval accumulators are small (``O(num_time_steps)``)
-        and are merged by task. No historical probability trajectory is kept.
+        and are merged by task. Only the fixed x_0 endpoint and current x_t
+        probabilities are retained; no historical trajectory is kept.
         """
         if not (
             len(batches) == len(sample_indices) == len(mask_seeds)
@@ -738,10 +725,10 @@ class FisherAnalyzer:
             for task in {item["task"] for item in prepared_items}
         }
         sample_interval_sums = [[0.0] * num_intervals for _ in prepared_items]
-        sample_path_lengths = [0.0] * len(prepared_items)
+        sample_endpoint_distance_sums = [0.0] * len(prepared_items)
         sample_negative_counts = [[0] * num_intervals for _ in prepared_items]
-        first_probabilities = None
-        previous_probabilities = None
+        endpoint_probabilities = None
+        last_probabilities = None
         static_batch = collate_analysis_states(
             [
                 dict(item["base_state"], input_ids=item["clean_input"])
@@ -762,21 +749,20 @@ class FisherAnalyzer:
                 fisher_chunk_size,
             )
             if step == 0:
-                previous_probabilities = step_probabilities
-                if save_distributions:
-                    first_probabilities = list(step_probabilities)
+                endpoint_probabilities = step_probabilities
+                last_probabilities = step_probabilities
                 del state_batch
                 continue
 
             delta_theta = float(
                 prepared_items[0]["theta"][step]
-                - prepared_items[0]["theta"][step - 1]
+                - prepared_items[0]["theta"][0]
             )
-            for item_index, (item, previous, current) in enumerate(
-                zip(prepared_items, previous_probabilities, step_probabilities)
+            for item_index, (item, endpoint, current) in enumerate(
+                zip(prepared_items, endpoint_probabilities, step_probabilities)
             ):
                 stats = fisher_interval_statistics(
-                    previous,
+                    endpoint,
                     current,
                     delta_theta,
                     c,
@@ -802,29 +788,18 @@ class FisherAnalyzer:
                 task_stats["sequence_distance_squared_sum"][interval_index] += (
                     stats["sequence_distance"] ** 2
                 )
-                task_stats["local_interval_sum"][interval_index] += stats[
-                    "local_interval_sum"
-                ]
-                task_stats["local_interval_squared_sum"][interval_index] += stats[
-                    "local_interval_squared_sum"
-                ]
-                task_stats["local_token_count"][interval_index] += stats[
-                    "target_count"
-                ]
-                task_stats["local_interval_negative_count"][interval_index] += stats[
-                    "local_negative_count"
-                ]
                 sample_interval_sums[item_index][interval_index] = stats[
                     "sequence_interval"
                 ]
                 sample_negative_counts[item_index][interval_index] = int(
                     stats["sequence_interval_negative"]
                 )
-                sample_path_lengths[item_index] += stats["sequence_distance"]
+                sample_endpoint_distance_sums[item_index] += stats[
+                    "sequence_distance"
+                ]
 
-            old_previous = previous_probabilities
-            previous_probabilities = step_probabilities
-            del old_previous, state_batch
+            last_probabilities = step_probabilities
+            del state_batch
 
         samples = []
         for item_index, (item, sample_index) in enumerate(
@@ -833,15 +808,15 @@ class FisherAnalyzer:
             task_stats = by_task[item["task"]]
             interval_mean = sum(sample_interval_sums[item_index]) / num_intervals
             negative_fraction = sum(sample_negative_counts[item_index]) / num_intervals
-            path_length = sample_path_lengths[item_index]
+            endpoint_distance_sum = sample_endpoint_distance_sums[item_index]
             task_stats["num_samples"] += 1
             task_stats["target_position_count"] += int(
                 item["target_positions"].numel()
             )
             task_stats["sample_interval_mean_sum"] += interval_mean
             task_stats["sample_interval_mean_squared_sum"] += interval_mean**2
-            task_stats["sample_path_length_sum"] += path_length
-            task_stats["sample_path_length_squared_sum"] += path_length**2
+            task_stats["sample_path_length_sum"] += endpoint_distance_sum
+            task_stats["sample_path_length_squared_sum"] += endpoint_distance_sum**2
             result = {
                 "sample_index": int(sample_index),
                 "task": item["task"],
@@ -851,16 +826,18 @@ class FisherAnalyzer:
                 "mask_seed": int(item["mask_seed"]),
                 "sequence_interval_mean": interval_mean,
                 "sequence_interval_negative_fraction": negative_fraction,
-                "fisher_rao_path_length": path_length,
+                "fisher_rao_endpoint_distance_sum": endpoint_distance_sum,
+                # Historical alias retained for existing visualization code.
+                "fisher_rao_path_length": endpoint_distance_sum,
             }
             if save_distributions:
-                if first_probabilities is None or previous_probabilities is None:
+                if endpoint_probabilities is None or last_probabilities is None:
                     raise RuntimeError("endpoint probabilities were not produced")
                 distribution_path = Path(output_dir) / f"fisher_{sample_index:06d}.pt"
                 torch.save(
                     {
-                        "prob_0": first_probabilities[item_index].cpu(),
-                        "prob_T": previous_probabilities[item_index].cpu(),
+                        "prob_0": endpoint_probabilities[item_index].cpu(),
+                        "prob_T": last_probabilities[item_index].cpu(),
                         "x_0": self.state_at(item, 0),
                         "x_T": self.state_at(item, num_time_steps - 1),
                         "alpha": item["alpha"],
@@ -873,7 +850,7 @@ class FisherAnalyzer:
                 result["distribution_path"] = str(distribution_path)
             samples.append(result)
 
-        del previous_probabilities, first_probabilities, static_batch
+        del endpoint_probabilities, last_probabilities, static_batch
         return {"num_samples": len(samples), "samples": samples, "by_task": by_task}
 
 
@@ -944,13 +921,15 @@ def finalize_rank_summary(
         {
             "interval_index": index,
             "step": index + 1,
-            "alpha_start": float(alpha[index]),
+            "reference_state": "x_0 (step 0)",
+            "current_state": "x_t (step index + 1)",
+            "alpha_start": float(alpha[0]),
             "alpha_end": float(alpha[index + 1]),
-            "theta_start": float(theta[index]),
+            "theta_start": float(theta[0]),
             "theta_end": float(theta[index + 1]),
-            "delta_theta": float(theta[index + 1] - theta[index]),
+            "delta_theta": float(theta[index + 1] - theta[0]),
             "time_metric_per_target": c**2
-            * float(theta[index + 1] - theta[index]) ** 2,
+            * float(theta[index + 1] - theta[0]) ** 2,
         }
         for index in range(num_time_steps - 1)
     ]
@@ -962,8 +941,10 @@ def finalize_rank_summary(
         "time_grid": time_grid,
         "interval_c": c,
         "interval_definition": (
-            "sum_j[(c*delta_theta)^2 - dF_j^2], with j over supervised "
-            "prediction positions only"
+            "len*(c*(theta_t-theta_0))^2 - sum_j "
+            "dF(prob_0,prob_t)_j^2, where len is the number of supervised "
+            "prediction positions in one sample and prob_0 is fixed for "
+            "every t."
         ),
         "by_task": {},
     }
@@ -972,21 +953,19 @@ def finalize_rank_summary(
         intervals = []
         for index, metadata in enumerate(intervals_meta):
             count = num_samples
-            token_count = int(stats["local_token_count"][index])
             sequence_mean = _safe_mean(
                 stats["sequence_interval_sum"][index], count
             )
             distance_mean = _safe_mean(
                 stats["sequence_distance_sum"][index], count
             )
-            local_mean = _safe_mean(
-                stats["local_interval_sum"][index], token_count
-            )
             interval = dict(metadata)
             interval.update(
                 {
                     "sample_count": count,
-                    "target_position_count": token_count,
+                    "target_position_count": int(
+                        stats["target_position_count"]
+                    ),
                     "sequence_interval_mean": sequence_mean,
                     "sequence_interval_std": _safe_std(
                         stats["sequence_interval_sum"][index],
@@ -1001,15 +980,6 @@ def finalize_rank_summary(
                         stats["sequence_distance_sum"][index],
                         stats["sequence_distance_squared_sum"][index],
                         count,
-                    ),
-                    "local_interval_mean": local_mean,
-                    "local_interval_std": _safe_std(
-                        stats["local_interval_sum"][index],
-                        stats["local_interval_squared_sum"][index],
-                        token_count,
-                    ),
-                    "local_interval_negative_fraction": _safe_mean(
-                        stats["local_interval_negative_count"][index], token_count
                     ),
                 }
             )
@@ -1036,6 +1006,9 @@ def finalize_rank_summary(
                 num_samples,
             ),
             "fisher_rao_path_length_mean": _safe_mean(
+                stats["sample_path_length_sum"], num_samples
+            ),
+            "fisher_rao_endpoint_distance_sum_mean": _safe_mean(
                 stats["sample_path_length_sum"], num_samples
             ),
             "fisher_rao_path_length_std": _safe_std(
