@@ -75,9 +75,9 @@ const DATA = JSON.parse(document.getElementById("fisher-data").textContent);
 const METRICS = __METRICS__;
 const state = { task: null, fileIndex: 0, logScale: false, showStd: true };
 
-const svg = document.getElementById("svg");
-const tooltip = document.getElementById("tooltip");
-const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("svg");
+  const tooltip = document.getElementById("tooltip");
+  const NS = "http://www.w3.org/2000/svg";
 
 function el(tag, attrs) {
   const node = document.createElementNS(NS, tag);
@@ -154,6 +154,18 @@ function render() {
   const plotH = height - margin.top - margin.bottom;
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.innerHTML = "";
+
+  const defs = el("defs", {});
+  const hatch = el("pattern", {
+    id: "negative-hatch", width: 8, height: 8,
+    patternUnits: "userSpaceOnUse", patternTransform: "rotate(0)",
+  });
+  hatch.appendChild(el("path", {
+    d: "M-2,2 L2,-2 M0,8 L8,0 M6,10 L10,6",
+    stroke: "#ffffff", "stroke-width": 1.2, fill: "none",
+  }));
+  defs.appendChild(hatch);
+  svg.appendChild(defs);
 
   const file = currentFile();
   const task = currentTask();
@@ -256,6 +268,12 @@ function render() {
     rect.addEventListener("mousemove", ev => showTooltip(ev, i));
     rect.addEventListener("mouseleave", hideTooltip);
     svg.appendChild(rect);
+    const texture = el("rect", {
+      x: x, y: yTop, width: barW, height: Math.max(0.5, yBase - yTop),
+      fill: "url(#negative-hatch)", opacity: 0.78 * negative,
+      "pointer-events": "none",
+    });
+    svg.appendChild(texture);
   }
 
   function showTooltip(ev, i) {
