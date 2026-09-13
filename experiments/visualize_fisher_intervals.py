@@ -19,7 +19,7 @@ METRICS = {
         "mean": "sequence_interval_mean",
         "std": "sequence_interval_std",
         "negative": "sequence_interval_negative_fraction",
-        "description": "len*(c*(theta_t-theta_0))^2 - sum_j dF(prob_0, prob_t)_j^2",
+        "description": "len*(c*tau_t)^2 - sum_j dF(prob_0, prob_t)_j^2, tau_t=2 asin(sqrt(realized mask ratio))",
     },
 }
 
@@ -278,12 +278,25 @@ function render() {
 
   function showTooltip(ev, i) {
     const iv = task.intervals[i];
+    const maskRatio = Number(iv.actual_mask_ratio_mean);
+    const maskRatioStd = Number(iv.actual_mask_ratio_std);
+    const maskLine = Number.isFinite(maskRatio)
+      ? `<div>actual mask ratio: ${fmt(maskRatio)} &plusmn; ${fmt(maskRatioStd)}</div>`
+      : "";
+    const temporal = Number(iv.actual_temporal_distance_mean);
+    const temporalStd = Number(iv.actual_temporal_distance_std);
+    const temporalLine = Number.isFinite(temporal)
+      ? `<div>actual temporal: ${fmt(temporal)} &plusmn; ${fmt(temporalStd)}` +
+        ` (nominal ${fmt(Number(iv.nominal_temporal_distance))})</div>`
+      : "";
     tooltip.innerHTML =
       `<div><b>${task.name}</b> &nbsp; interval ${i + 1} / step ${iv.step || i + 1}</div>` +
       `<div>mean=${fmt(iv[metric.mean])} &plusmn; ${fmt(iv[metric.std])} ` +
       `(neg ${(iv[metric.negative] * 100).toFixed(2)}%)</div>` +
       `<div>&alpha;: ${iv.alpha_start.toFixed(4)} &rarr; ${iv.alpha_end.toFixed(4)}` +
-      ` &nbsp; &Delta;&theta;: ${iv.delta_theta.toExponential(2)}</div>` +
+      ` &nbsp; nominal mask: ${(1 - iv.alpha_end).toFixed(4)}</div>` +
+      maskLine +
+      temporalLine +
       `<div>target positions: ${iv.target_position_count}</div>`;
     tooltip.style.display = "block";
     const host = document.getElementById("chart").getBoundingClientRect();

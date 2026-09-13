@@ -164,6 +164,12 @@ def _new_task_interval_stats(num_intervals: int) -> Dict:
         "sequence_interval_negative_count": counts(),
         "sequence_distance_sum": zeros(),
         "sequence_distance_squared_sum": zeros(),
+        "actual_mask_ratio_sum": zeros(),
+        "actual_mask_ratio_squared_sum": zeros(),
+        "actual_temporal_distance_sum": zeros(),
+        "actual_temporal_distance_squared_sum": zeros(),
+        "time_metric_per_target_sum": zeros(),
+        "time_metric_per_target_squared_sum": zeros(),
         "sample_interval_mean_sum": 0.0,
         "sample_interval_mean_squared_sum": 0.0,
         "sample_path_length_sum": 0.0,
@@ -205,12 +211,14 @@ def _merge_rank_summaries(destination: Dict, source: Dict) -> None:
 def fisher_interval_statistics(
     previous: torch.Tensor,
     current: torch.Tensor,
-    delta_time: float,
+    temporal_distance: float,
     c: float,
     row_chunk_size: int = 256,
 ) -> Dict[str, float]:
     """Compute one interval using bounded row temporaries.
 
+    ``temporal_distance`` is the realized Fisher-angle distance for the current
+    state relative to the clean endpoint, not the nominal sampling timestep.
     ``previous`` and ``current`` are the only trajectory tensors retained by
     the caller. Fisher angles are reduced chunk by chunk, so this function
     never materializes a full ``[target_positions]`` distance vector.
@@ -224,7 +232,7 @@ def fisher_interval_statistics(
         raise ValueError("Fisher interval requires at least one target")
 
     distance_squared_sum = 0.0
-    temporal_per_token = (c * float(delta_time)) ** 2
+    temporal_per_token = (c * float(temporal_distance)) ** 2
     for start in range(0, target_count, row_chunk_size):
         stop = min(start + row_chunk_size, target_count)
         distances = fisher_rao_distance(previous[start:stop], current[start:stop])
@@ -237,6 +245,8 @@ def fisher_interval_statistics(
     sequence_interval = target_count * temporal_per_token - distance_squared_sum
     return {
         "target_count": target_count,
+        "temporal_distance": float(temporal_distance),
+        "time_metric_per_target": temporal_per_token,
         "sequence_distance": sequence_distance,
         "sequence_interval": sequence_interval,
         "sequence_interval_squared": sequence_interval**2,
@@ -247,6 +257,11 @@ def fisher_interval_statistics(
 def theta_from_alpha(alpha: torch.Tensor) -> torch.Tensor:
     """Fisher-angle clock for a masked channel with retention alpha."""
     return 2.0 * torch.acos(alpha.clamp(0.0, 1.0).sqrt())
+
+
+def theta_from_mask_ratio(mask_ratio: torch.Tensor) -> torch.Tensor:
+    """Map a realized mask ratio back to the original Fisher time axis."""
+    return 2.0 * torch.asin(mask_ratio.clamp(0.0, 1.0).sqrt())
 
 
 def _as_audio_list(value) -> List[torch.Tensor]:
@@ -672,15 +687,34 @@ class FisherAnalyzer:
         }
 
     @staticmethod
-    def state_at(prepared: Dict, step: int) -> torch.Tensor:
-        """Materialize one masked state on CPU for the next model forward."""
+    def mask_at(prepared: Dict, step: int) -> torch.Tensor:
+        """Return the realized mask sampled for one trajectory step."""
         alpha_value = prepared["alpha"][step]
-        state_mask = prepared["target_mask"] & (
+        return prepared["target_mask"] & (
             prepared["mask_scores"] >= alpha_value
         )
+
+    @classmethod
+    def state_at(cls, prepared: Dict, step: int) -> torch.Tensor:
+        """Materialize one masked state on CPU for the next model forward."""
         state_ids = prepared["clean_input"].clone()
-        state_ids[state_mask] = MASK_TOKEN_ID
+        state_ids[cls.mask_at(prepared, step)] = MASK_TOKEN_ID
         return state_ids
+
+    @classmethod
+    def actual_target_mask_ratio(cls, prepared: Dict, step: int) -> float:
+        """Return the realized mask fraction over measured target positions."""
+        target_positions = prepared["target_positions"]
+        if target_positions.numel() == 0:
+            raise ValueError("mask ratio requires at least one target position")
+        measured_mask = cls.mask_at(prepared, step)[target_positions]
+        return float(measured_mask.float().mean())
+
+    @classmethod
+    def actual_target_theta(cls, prepared: Dict, step: int) -> float:
+        """Map the realized target mask ratio onto the original [0, pi] axis."""
+        ratio = cls.actual_target_mask_ratio(prepared, step)
+        return float(theta_from_mask_ratio(torch.tensor(ratio)))
 
     def analyze_batch(
         self,
@@ -754,17 +788,18 @@ class FisherAnalyzer:
                 del state_batch
                 continue
 
-            delta_theta = float(
-                prepared_items[0]["theta"][step]
-                - prepared_items[0]["theta"][0]
-            )
             for item_index, (item, endpoint, current) in enumerate(
                 zip(prepared_items, endpoint_probabilities, step_probabilities)
             ):
+                # alpha/theta specify the sampling threshold, but a finite
+                # discrete sequence realizes a sample-specific mask ratio.
+                # Map that ratio back to the original Fisher-angle axis.
+                actual_mask_ratio = self.actual_target_mask_ratio(item, step)
+                actual_temporal_distance = self.actual_target_theta(item, step)
                 stats = fisher_interval_statistics(
                     endpoint,
                     current,
-                    delta_theta,
+                    actual_temporal_distance,
                     c,
                     # Probability softmax chunks control projection peak
                     # memory; larger Fisher row chunks avoid Python-loop
@@ -787,6 +822,25 @@ class FisherAnalyzer:
                 ]
                 task_stats["sequence_distance_squared_sum"][interval_index] += (
                     stats["sequence_distance"] ** 2
+                )
+                task_stats["actual_mask_ratio_sum"][interval_index] += (
+                    actual_mask_ratio
+                )
+                task_stats["actual_mask_ratio_squared_sum"][interval_index] += (
+                    actual_mask_ratio**2
+                )
+                task_stats["actual_temporal_distance_sum"][interval_index] += (
+                    actual_temporal_distance
+                )
+                task_stats["actual_temporal_distance_squared_sum"][interval_index] += (
+                    actual_temporal_distance**2
+                )
+                time_metric_per_target = stats["time_metric_per_target"]
+                task_stats["time_metric_per_target_sum"][interval_index] += (
+                    time_metric_per_target
+                )
+                task_stats["time_metric_per_target_squared_sum"][interval_index] += (
+                    time_metric_per_target**2
                 )
                 sample_interval_sums[item_index][interval_index] = stats[
                     "sequence_interval"
@@ -842,6 +896,20 @@ class FisherAnalyzer:
                         "x_T": self.state_at(item, num_time_steps - 1),
                         "alpha": item["alpha"],
                         "theta": item["theta"],
+                        "actual_target_mask_ratio": torch.tensor(
+                            [
+                                self.actual_target_mask_ratio(item, step)
+                                for step in range(num_time_steps)
+                            ],
+                            dtype=torch.float32,
+                        ),
+                        "actual_target_theta": torch.tensor(
+                            [
+                                self.actual_target_theta(item, step)
+                                for step in range(num_time_steps)
+                            ],
+                            dtype=torch.float32,
+                        ),
                         "target_positions": item["target_positions"],
                         "target_token_ids": item["target_ids"],
                     },
@@ -928,8 +996,9 @@ def finalize_rank_summary(
             "theta_start": float(theta[0]),
             "theta_end": float(theta[index + 1]),
             "delta_theta": float(theta[index + 1] - theta[0]),
-            "time_metric_per_target": c**2
-            * float(theta[index + 1] - theta[0]) ** 2,
+            "nominal_temporal_distance": float(theta[index + 1] - theta[0]),
+            "nominal_mask_probability_start": float(1.0 - alpha[0]),
+            "nominal_mask_probability_end": float(1.0 - alpha[index + 1]),
         }
         for index in range(num_time_steps - 1)
     ]
@@ -941,10 +1010,11 @@ def finalize_rank_summary(
         "time_grid": time_grid,
         "interval_c": c,
         "interval_definition": (
-            "len*(c*(theta_t-theta_0))^2 - sum_j "
+            "len*(c*tau_t)^2 - sum_j "
             "dF(prob_0,prob_t)_j^2, where len is the number of supervised "
-            "prediction positions in one sample and prob_0 is fixed for "
-            "every t."
+            "prediction positions, r_t is that sample's realized masked "
+            "fraction over those positions, tau_t=2*asin(sqrt(r_t)) is its "
+            "Fisher-angle time, and prob_0 is fixed for every t."
         ),
         "by_task": {},
     }
@@ -979,6 +1049,30 @@ def finalize_rank_summary(
                     "sequence_fisher_distance_std": _safe_std(
                         stats["sequence_distance_sum"][index],
                         stats["sequence_distance_squared_sum"][index],
+                        count,
+                    ),
+                    "actual_mask_ratio_mean": _safe_mean(
+                        stats["actual_mask_ratio_sum"][index], count
+                    ),
+                    "actual_mask_ratio_std": _safe_std(
+                        stats["actual_mask_ratio_sum"][index],
+                        stats["actual_mask_ratio_squared_sum"][index],
+                        count,
+                    ),
+                    "actual_temporal_distance_mean": _safe_mean(
+                        stats["actual_temporal_distance_sum"][index], count
+                    ),
+                    "actual_temporal_distance_std": _safe_std(
+                        stats["actual_temporal_distance_sum"][index],
+                        stats["actual_temporal_distance_squared_sum"][index],
+                        count,
+                    ),
+                    "time_metric_per_target_mean": _safe_mean(
+                        stats["time_metric_per_target_sum"][index], count
+                    ),
+                    "time_metric_per_target_std": _safe_std(
+                        stats["time_metric_per_target_sum"][index],
+                        stats["time_metric_per_target_squared_sum"][index],
                         count,
                     ),
                 }
