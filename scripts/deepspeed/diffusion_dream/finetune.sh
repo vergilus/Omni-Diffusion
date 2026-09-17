@@ -6,7 +6,7 @@ set -x
 SEQ_LENGTH="$1"
 if [ -z "$SEQ_LENGTH" ]
 then
-    SEQ_LENGTH=3072
+    SEQ_LENGTH=4096
 fi
 
 timestamp="$2"
@@ -97,14 +97,14 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.p
     --torch_dtype bfloat16 \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs 1 \
-    --max_steps 24000 \
+    --max_steps 8000 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --save_strategy "steps" \
-    --save_steps 500 \
-    --save_total_limit 4 \
-    --learning_rate 1.00e-5 \
+    --save_steps 100 \
+    --save_total_limit 2 \
+    --learning_rate 1.00e-6 \
     --max_grad_norm 1.0 \
     --weight_decay 0.0 \
     --adam_beta1 0.9 \
@@ -127,7 +127,7 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS tools/finetune_dream_v4_51_3.p
     --reset_position_ids \
     --dataloader_num_workers 1 \
     --audio-model-freeze \
-    --image_size 256 \
+    --image_size 512 \
     --overwrite_output_dir \
 
 set +x

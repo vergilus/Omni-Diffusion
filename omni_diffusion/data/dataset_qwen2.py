@@ -29,13 +29,13 @@ def forward_process(
     bsz: int,
     seq_len: int,
     device: torch.device,
-    labels: torch.Tensor,                
+    labels: torch.Tensor,
     eps: float = 1e-3,
-    special_token_id: int = 151643,     
-    special_mask_ratio: float = 0.1      
+    special_token_id: int = 151643,
+    special_mask_ratio: float = 0.1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Generates a mask for the input sequences, applying different masking probabilities 
+    Generates a mask for the input sequences, applying different masking probabilities
     for normal tokens and special tokens within the valid (non-padded) regions.
     """
 
@@ -98,7 +98,7 @@ def forward_process(
 
 def update_labels(input_ids, labels, eos_id, max_n=20):
     """
-    Finds the first occurrence of the EOS token in each sequence and updates 
+    Finds the first occurrence of the EOS token in each sequence and updates
     up to `max_n` subsequent labels to the EOS token ID.
     """
     batch_size, seq_len = input_ids.shape
@@ -110,13 +110,13 @@ def update_labels(input_ids, labels, eos_id, max_n=20):
         if len(eos_positions) > 0:
             first_occurrence_indices.append(eos_positions[0].item())
         else:
-            first_occurrence_indices.append(-1)  
+            first_occurrence_indices.append(-1)
 
     # Select a random number of sequential positions (up to max_n) starting from first_idx to update
     for i in range(batch_size):
         first_idx = first_occurrence_indices[i]
         if first_idx == -1:
-            continue 
+            continue
         max_possible = seq_len - first_idx
 
         if max_possible <= 0:
@@ -175,7 +175,7 @@ def update_labels_and_inputs(input_ids, labels, eos_id, max_n=20):
 
 
 def pad_or_truncate_to_512(
-        input_ids, 
+        input_ids,
         labels,
         eos_id,
         target_len: int = 512,
@@ -450,7 +450,7 @@ class Qwen2Dataset(BaseDataset):
         if self.max_padding_length >= 2**17:
             log_interval = 1000
         if self.max_padding_length >= 2**20:
-            log_interval = 200 
+            log_interval = 200
 
         processed_samples = sum(self.processed_samples.values())
         unjoint_samples = sum(self.unjoint_samples.values())
@@ -715,7 +715,7 @@ def preprocess(
     # ----------------------------------------------------------------
     if has_audio(sample) and processor["audio"].is_discrete:
         unused_audio_idxs = list(range(len(sample["audios"])))
-        
+
         audio_tokens_list = [
             processor["audio"].process_audios(x, is_discrete=True) for x in sample["audios"]
         ]
@@ -755,15 +755,15 @@ def preprocess(
         image_tokens_512_list = [x[0].tolist() for x in image_tokens_512_list]
         image_tokens_512_list = ["".join(f"<|image_{i}|>" for i in x) for x in image_tokens_512_list]
 
-        # for image generation
-        image_tokens_256_list = [
-            processor["image"].process_images_with_subpatch(x, 256) for x in sample["images"]
-        ]
-        image_tokens_256_list = [
-            processor["image"].get_image_token(x) for x in image_tokens_256_list
-        ]
-        image_tokens_256_list = [x[0].tolist() for x in image_tokens_256_list]
-        image_tokens_256_list = ["".join(f"<|image_{i}|>" for i in x) for x in image_tokens_256_list]
+        # # for image generation
+        # image_tokens_256_list = [
+        #     processor["image"].process_images_with_subpatch(x, 256) for x in sample["images"]
+        # ]
+        # image_tokens_256_list = [
+        #     processor["image"].get_image_token(x) for x in image_tokens_256_list
+        # ]
+        # image_tokens_256_list = [x[0].tolist() for x in image_tokens_256_list]
+        # image_tokens_256_list = ["".join(f"<|image_{i}|>" for i in x) for x in image_tokens_256_list]
 
         image_idx = 0
         for j, sentence in enumerate(messages):
@@ -777,20 +777,20 @@ def preprocess(
                 image_resolution = 256
 
             while IMG_TAG_TOKEN in content:
-                if image_resolution == 256:
-                    content = content.replace(
-                        IMG_TAG_TOKEN,
-                        f"{IMG_START_TOKEN}{image_tokens_256_list[image_idx]}{IMG_END_TOKEN}",
-                        1,
-                    )
-                    # <|begin_of_image|> <|image_0|> <|image_1|> ... <|image_n|> <|end_of_image|>
-                else:
-                    content = content.replace(
-                        IMG_TAG_TOKEN,
-                        f"{IMG_START_TOKEN}{image_tokens_512_list[image_idx]}{IMG_END_TOKEN}",
-                        1,
-                    )
-                    # <|begin_of_image|> <|image_0|> <|image_1|> ... <|image_n|> <|end_of_image|>
+                # if image_resolution == 256:
+                #     content = content.replace(
+                #         IMG_TAG_TOKEN,
+                #         f"{IMG_START_TOKEN}{image_tokens_256_list[image_idx]}{IMG_END_TOKEN}",
+                #         1,
+                #     )
+                #     # <|begin_of_image|> <|image_0|> <|image_1|> ... <|image_n|> <|end_of_image|>
+                # else:
+                content = content.replace(
+                    IMG_TAG_TOKEN,
+                    f"{IMG_START_TOKEN}{image_tokens_512_list[image_idx]}{IMG_END_TOKEN}",
+                    1,
+                )
+                # <|begin_of_image|> <|image_0|> <|image_1|> ... <|image_n|> <|end_of_image|>
                 image_idx += 1
             else:
                 image_idx += content.count(IMG_TAG_TOKEN)
@@ -919,15 +919,15 @@ def preprocess(
         image_indices = torch.cat(image_indices, dim=1)
 
     # ----------------------------------------------------------------
-    # 6. Final Masking and Label Updating 
+    # 6. Final Masking and Label Updating
     # ----------------------------------------------------------------
     origin_input = input_ids
     labels = targets
-    eos_id = 151643               
-    mask_id = 151666    
+    eos_id = 151643
+    mask_id = 151666
     input_ids, labels = update_labels_and_inputs(input_ids,labels,eos_id,16)
 
-    labels_mask           = ~(labels == -100) 
+    labels_mask           = ~(labels == -100)
     bsz, seq_len          = labels_mask.shape
     masked_indices, p_mask = forward_process(
         bsz, seq_len, input_ids.device, labels,special_mask_ratio=0.6, special_token_id=eos_id
@@ -945,7 +945,7 @@ def preprocess(
     new_labels = new_labels.squeeze(0).cpu().tolist()
     attention_mask = [1] * len(input_ids)
     assert len(new_labels) == len(input_ids)
-    
+
     return dict(
         input_ids=input_ids,
         labels=new_labels,

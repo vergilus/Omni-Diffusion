@@ -158,7 +158,7 @@ class ModelArguments:
     vision_projector_pre_norm: bool = field(default=False, metadata={"help": ""})
     vision_downsample_ratio: float = field(default=0.5, metadata={"help": ""})
 
-    image_size: int = field(default=448, metadata={"help": ""})
+    image_size: int = field(default=512, metadata={"help": ""})
     image_token_length: int = field(default=1025, metadata={"help": ""})
     max_num_frame: int = field(default=16, metadata={"help": ""})
     max_fps: int = field(default=1, metadata={"help": ""})

@@ -229,7 +229,7 @@ class S2SInference:
             messages[-1]["content"] = messages[-1]["content"].replace(
                 "<|audio|>", f"<|begin_of_audio|>{audio_tokens}<|end_of_audio|>"
             )
-        
+
         if image_path is not None:
             image_tokens = self.image_processor.process_images_with_subpatch(image_path, 512)
             image_tokens = self.image_processor.get_image_token(image_tokens)
@@ -274,7 +274,7 @@ class S2SInference:
             audios=audios,
             audio_indices=audio_indices,
             temperature=0.0,
-            top_p=0.9,  
+            top_p=0.9,
             steps=steps,
             max_new_tokens = max_tokens,
             alg=alg,
@@ -289,7 +289,7 @@ class S2SInference:
 
         output = self.tokenizer.decode(outputs[0][input_ids.shape[1]: ], skip_special_tokens=False)
         print(f"{output=}", flush=True)
-        
+
         audio_offset = self.tokenizer.convert_tokens_to_ids("<|audio_0|>")
         audio_tokens = []
         image_offset = self.tokenizer.convert_tokens_to_ids("<|image_0|>")
@@ -310,14 +310,14 @@ class S2SInference:
         else:
             tts_speech = None
 
-        if len(image_tokens) < 256 and len(image_tokens) > 0:
-            image_tokens += [image_tokens[-1]] * (256 - len(image_tokens))
+        if len(image_tokens) < 1024 and len(image_tokens) > 0:
+            image_tokens += [image_tokens[-1]] * (1024 - len(image_tokens))
 
         image = None
         if len(image_tokens) > 0:
             gen_token_ids = torch.stack(image_tokens, dim=0).unsqueeze(0)
             gen_token_ids = torch.clamp(gen_token_ids, max=8192 - 1, min=0)
-            image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(gen_token_ids[:, :256]) 
+            image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(gen_token_ids[:, :1024])
             image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
             image *= 255.0
             image = image.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
@@ -357,7 +357,7 @@ def tts_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
 def asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     outputs = []
     for audio_path in [
-        "asset/asr_0.wav", 
+        "asset/asr_0.wav",
     ]:
         print("=" * 100)
         print("asr_task")
@@ -372,7 +372,7 @@ def asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
             alg=alg,
             repeat_penalty=repeat_penalty,
         )
-        output = output[:output.index("<|im_end|>")] 
+        output = output[:output.index("<|im_end|>")]
         print(f"{output=}", flush=True)
         outputs.append(output)
 
@@ -406,7 +406,7 @@ def vqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
 def t2i_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     outputs = []
     images = []
-    
+
     prompts = [
         "A black-and-white charcoal pencil sketch of a human skeleton, low angle shot, soft shading, clearly visible clavicle and neck bones. Faded edges blending seamlessly into the off-white background, misty and hazy effect, rough sketch paper texture, gritty realism, artistic monochrome illustration, cinematic moody lighting",
         "The image shows a landscape background with double exposure glasses of wine, displaying a hyperealistic and detailed view of the subject."
@@ -431,7 +431,7 @@ def s2i_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     outputs = []
     images = []
     for audio_path in [
-        "asset/s2i_0.wav", #A super realistic and hyper-detailed 8k image showing a fantasy night scene with an amazing beach under the full moon, lit by dramatic lighting.  
+        "asset/s2i_0.wav", #A super realistic and hyper-detailed 8k image showing a fantasy night scene with an amazing beach under the full moon, lit by dramatic lighting.
         ]:
 
         output, _, image = s2s_inference.run_infer(
@@ -459,7 +459,7 @@ def svqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty):
     image_paths = [
         "asset/svqa_0.jpg",
     ]
-    
+
     outputs = []
     audios = []
     for audio_path, img_path in zip(audio_paths, image_paths):
@@ -531,16 +531,16 @@ if __name__ == "__main__":
     s2s_inference = S2SInference(
         model_name_or_path, audio_tokenizer_path, audio_tokenizer_type, image_tokenizer_path, flow_path=flow_path,
     )
-    
+
     images = None
     speech = None
 
     # speech-to-image
-    output, images = s2i_task(s2s_inference, 260, 260, "entropy-penalty", 1.5)
+    output, images = s2i_task(s2s_inference, 1500, 250, "entropy-penalty", 1.5)
     save_output(output_path, "s2i", output, images, None)
 
     # text-to-image
-    output, images = t2i_task(s2s_inference, 350, 260, "entropy-penalty", 1.2)
+    output, images = t2i_task(s2s_inference, 1500, 250, "entropy-penalty", 1.2)
     save_output(output_path, "t2i", output, images, None)
 
     # spoken visual qa
@@ -548,13 +548,13 @@ if __name__ == "__main__":
     save_output(output_path, "svqa", output, None, speech)
 
     # visual qa
-    output = vqa_task(s2s_inference, 64, 64, "entropy", 1.0)
+    output = vqa_task(s2s_inference, 512, 128, "entropy", 1.0)
     save_output(output_path, "vqa", output, None, None)
 
     # tts
-    output, speech = tts_task(s2s_inference, 300, 50, "entropy", 1.0)
+    output, speech = tts_task(s2s_inference, 300, 100, "entropy", 1.0)
     save_output(output_path, "tts", output, None, speech)
 
     # asr
-    output = asr_task(s2s_inference, -1, -1, "entropy", 1.0)  # steps and max_tokens are overridden in the run_infer  
+    output = asr_task(s2s_inference, -1, -1, "entropy", 1.0)  # steps and max_tokens are overridden in the run_infer
     save_output(output_path, "asr", output, None, None)

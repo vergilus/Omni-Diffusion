@@ -30,6 +30,41 @@ def image_transform(image, resolution=256):
     return image
 
 
+def expand2square(image, background_color):
+    """Pad an image to a centered square without cropping its content."""
+    width, height = image.size
+    if width == height:
+        return image
+
+    side = max(width, height)
+    square = Image.new(image.mode, (side, side), background_color)
+    offset = ((side - width) // 2, (side - height) // 2)
+    square.paste(image, offset)
+    return square
+
+
+def image_transform_letterbox(image, resolution=256, background_color=None):
+    """Fit an image inside a square and letterbox-pad it without cropping."""
+    if background_color is None:
+        background_color = tuple(
+            int(channel * 255) for channel in IMAGENET_DEFAULT_MEAN
+        )
+
+    width, height = image.size
+    scale = resolution / max(width, height)
+    resized_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    image = image.resize(resized_size, Image.Resampling.LANCZOS)
+    image = expand2square(image, background_color)
+    image = transforms.ToTensor()(image)
+    image = transforms.Normalize(
+        mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+    )(image)
+    return image
+
+
 class ImageProcessor:
     def __init__(
         self,
@@ -94,7 +129,7 @@ class ImageProcessor:
     def load_model(self):
         if self.image_tokenizer is not None:
             self.image_tokenizer.load_model()
-        
+
     def process_images(self, img_or_path_list, image_resolution):
 
         if isinstance(img_or_path_list[0], str):
@@ -108,18 +143,16 @@ class ImageProcessor:
         image_tensor = torch.ones([len(images), 3, image_resolution, image_resolution])
 
         for i, image in enumerate(images):
-            image = image_transform(image, resolution=image_resolution)
-            
+            image = image_transform_letterbox(image, resolution=image_resolution)
             image_tensor[i] = image
 
         return image_tensor
 
     def process_images_with_subpatch(self, img_or_path, image_resolution):
         return self.process_images([img_or_path], image_resolution)
-    
+
     def get_image_token(self, image):
         return self.image_tokenizer.encode(image)
-    
 
 def select_best_resolution(original_size, possible_resolutions):
     """
@@ -127,7 +160,7 @@ def select_best_resolution(original_size, possible_resolutions):
 
     Args:
         original_size (tuple): The original size of the image in the format (width, height).
-        possible_resolutions (list): A list of possible resolutions in the format [(width1, height1), 
+        possible_resolutions (list): A list of possible resolutions in the format [(width1, height1),
             (width2, height2), ...].
 
     Returns:
